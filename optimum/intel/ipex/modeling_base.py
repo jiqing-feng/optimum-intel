@@ -10,12 +10,25 @@ from transformers import (
     AutoModel,
     GenerationMixin,
     PretrainedConfig,
+    AutoConfig,
 )
 from transformers.models.auto.auto_factory import _get_model_class
 from transformers.utils import WEIGHTS_NAME
 
 from optimum.modeling_base import OptimizedModel
+from ..utils.import_utils import is_torch_version
+from optimum.exporters import TasksManager
+import intel_extension_for_pytorch as ipex
+from ..utils.modeling_utils import patch_decoder_attention_mask
 
+SUPPORT_MODEL_LIST_FOR_CAUSAL_LM = {
+  #  "llama": LlamaForCausalLM
+}
+
+SUPPORT_TASK_LIST = {
+    "text-generation": SUPPORT_MODEL_LIST_FOR_CAUSAL_LM
+}
+from ..generation.modeling import jit_trace
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +46,96 @@ class IPEXModel(OptimizedModel):
         use_cache: bool = True,
         **kwargs,
     ):
-        super(IPEXModel, self).__init__(
-            model=model, config=config, model_save_dir=model_save_dir, use_cache=use_cache, **kwargs
+        OptimizedModel.__init__(self,
+            model=model, config=config
         )
+        # add XPU support
+        self._device = torch.device("cpu")
         self.model.to(self._device)
+
+        # Registers the INCModelForXXX classes into the transformers AutoModel classes to avoid warnings when creating
+        # a pipeline https://github.com/huggingface/transformers/blob/cad61b68396a1a387287a8e2e2fef78a25b79383/src/transformers/pipelines/base.py#L863
+        AutoConfig.register(self.base_model_prefix, AutoConfig)
+        if hasattr(self.auto_model_class, "register"):
+            self.auto_model_class.register(AutoConfig, self.__class__)
+
+    @classmethod
+    def _from_transformers(
+        cls,
+        model_id: str,
+        config: PretrainedConfig,
+        use_auth_token: Optional[Union[bool, str]] = None,
+        revision: Optional[str] = None,
+        force_download: bool = False,
+        cache_dir: Optional[str] = None,
+        subfolder: str = "",
+        local_files_only: bool = False,
+        use_cache: bool = True,
+        torch_dtype: Optional[Union[str, "torch.dtype"]] = None,
+        **kwargs,
+    ):
+        if is_torch_version("<", "2.1.0"):
+            raise ImportError("`torch>=2.0.0` is needed to trace your model")
+        task = cls.export_feature
+        model_kwargs = {
+            "revision": revision,
+            "use_auth_token": use_auth_token,
+            "cache_dir": cache_dir,
+            "subfolder": subfolder,
+            "local_files_only": local_files_only,
+            "force_download": force_download,
+            "use_cache": use_cache,
+            "torch_dtype": torch_dtype,
+            "device": "cpu",
+        }
+        model_type = None
+        support_ipex_transformers = False
+        if task in SUPPORT_TASK_LIST.keys():
+            for name in SUPPORT_TASK_LIST[task].keys():
+                if name in model_id:
+                    support_ipex_transformers = True
+                    model_type = name
+                    break
+
+        if support_ipex_transformers and task in SUPPORT_TASK_LIST and model_type in SUPPORT_TASK_LIST[task]:
+            # model = SUPPORT_TASK_LIST[task][model_type].from_pretrained(model_id, **model_kwargs)
+            pass
+        else:
+            model = TasksManager.get_model_from_task(task, model_id, **model_kwargs)
+            model = patch_decoder_attention_mask(model)
+
+        model = ipex.optimize(model, dtype=torch_dtype, level="O1", auto_kernel_selection=True)
+
+        if kwargs.pop("jit",True):
+            try:
+                traced_model = cls.apply_jit_optimize(model, task, use_cache, support_ipex_transformers)
+                save_dir = TemporaryDirectory()
+                save_dir_path = Path(save_dir.name)
+                torch.jit.save(traced_model, save_dir_path / WEIGHTS_NAME)
+                config.torchscript = True
+
+                return cls._from_pretrained(
+                    model_id=save_dir_path,
+                    config=config,
+                    use_cache=use_cache,
+                    use_auth_token=use_auth_token,
+                    revision=revision,
+                    force_download=force_download,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                    model_dtype=torch_dtype,
+                    **kwargs,
+                )
+            except Exception as e:
+                logger.warning(f"failed to use PyTorch jit mode due to: {e}.")
+
+        return cls(
+            model,
+            config=config,
+            use_cache=use_cache,
+            model_dtype=torch_dtype,
+            **kwargs,
+        )
 
     @classmethod
     def _from_pretrained(
@@ -50,7 +149,6 @@ class IPEXModel(OptimizedModel):
         file_name: Optional[str] = WEIGHTS_NAME,
         local_files_only: bool = False,
         use_cache: bool = True,
-        jit: bool = True,
         **kwargs,
     ):
         # Load the model from local directory
@@ -116,3 +214,7 @@ class IPEXModel(OptimizedModel):
                 f"The current model class {self.model.__class__} is not compatible with `.generate()`, as it doesn't have a language model head."
             )
         return self.model.generate(*args, **kwargs)
+
+    @classmethod
+    def apply_jit_optimize(cls, model, task, use_cache, support_ipex_transformers=False):
+        return jit_trace(model, task, use_cache)
