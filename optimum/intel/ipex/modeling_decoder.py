@@ -3,12 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Optional, Union
 
-import intel_extension_for_pytorch as ipex
-import torch
-from transformers import AutoModelForCausalLM, PretrainedConfig, AutoModelForSequenceClassification
-from transformers.utils import WEIGHTS_NAME
-
-
+from transformers import AutoModelForCausalLM, PretrainedConfig
 
 from ..generation.modeling import BaseModelForCausalLM, jit_trace
 from .modeling_base import IPEXModel
@@ -44,7 +39,3 @@ class IPEXModelForCausalLM(IPEXModel, BaseModelForCausalLM):
             # dummy_jit_inputs = get_dummy_input(task, model) # From ipex
             # model = torch.jit.trace(model, example_input_kwargs=dummy_jit_inputs)
             return model
-
-class IPEXModelForSequenceClassification(IPEXModel):
-    auto_model_class = AutoModelForSequenceClassification
-    export_feature = "text-classification"
