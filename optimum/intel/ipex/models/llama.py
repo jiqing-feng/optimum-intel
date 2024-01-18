@@ -297,13 +297,6 @@ class IPEXLlamaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
 
-        def get_weight_shape(mod):
-            if hasattr(mod, "in_features") and hasattr(mod, "out_features"):
-                return [mod.in_features, mod.out_features]
-            elif hasattr(mod, "weight") and hasattr(mod.weight, "shape"):
-                return list(mod.weight.shape)
-            return None
-
         self.ipex_scale_dot_product = IndirectKVCache(text_max_length=self.max_position_embeddings)
 
         self._init_rope()
