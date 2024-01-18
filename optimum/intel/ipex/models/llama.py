@@ -42,10 +42,6 @@ from transformers.utils import (
 from transformers.utils.import_utils import is_torch_fx_available
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-# from models.reference.modules.attentions import _IPEXConcatLinearRef, _IPEXRopeRef, _IPEXScaleDotProductRef
-# from models.cpu.modules.attentions import _IPEXConcatLinearCPU, _IPEXRopeCPU, _IPEXScaleDotProductCPU
-# from models.reference.modules.decoder import _IPEXlinearAddRef, _IPEXlinearSiluMulRef
-# from models.cpu.modules.decoder import _IPEXlinearAddCPU, _IPEXlinearSiluMulCPU
 from intel_extension_for_pytorch.llm.modules import linearAdd, linear2SiluMul, ApplyRotaryEmbedding, IndirectKVCache
 import intel_extension_for_pytorch as ipex
 
