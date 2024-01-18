@@ -25,9 +25,10 @@ from ..utils.import_utils import is_torch_version
 from ..utils.modeling_utils import patch_decoder_attention_mask
 from . import generation_tasks
 
+from .models.llama import LlamaForCausalLM
 
 SUPPORT_MODEL_LIST_FOR_CAUSAL_LM = {
-    #  "llama": LlamaForCausalLM
+     "llama": LlamaForCausalLM
 }
 
 SUPPORT_TASK_LIST = {"text-generation": SUPPORT_MODEL_LIST_FOR_CAUSAL_LM}
@@ -87,7 +88,6 @@ class IPEXModel(OptimizedModel):
             "force_download": force_download,
             "use_cache": use_cache,
             "torch_dtype": torch_dtype,
-            "device": "cpu",
         }
         if task not in generation_tasks:
             model_kwargs.pop("use_cache")
@@ -101,13 +101,13 @@ class IPEXModel(OptimizedModel):
                     break
 
         if support_ipex_transformers and task in SUPPORT_TASK_LIST and model_type in SUPPORT_TASK_LIST[task]:
-            # model = SUPPORT_TASK_LIST[task][model_type].from_pretrained(model_id, **model_kwargs)
-            pass
+            model = SUPPORT_TASK_LIST[task][model_type].from_pretrained(model_id, **model_kwargs)
         else:
             model = TasksManager.get_model_from_task(task, model_id, **model_kwargs)
             model = patch_decoder_attention_mask(model)
 
-        model = ipex.optimize(model, dtype=torch_dtype, level="O1", auto_kernel_selection=True)
+        if not support_ipex_transformers:
+            model = ipex.optimize(model, dtype=torch_dtype, level="O1", auto_kernel_selection=True)
 
         if kwargs.pop("jit", True):
             try:
