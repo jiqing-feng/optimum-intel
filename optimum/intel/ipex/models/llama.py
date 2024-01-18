@@ -264,29 +264,6 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-class LlamaConcatLayer(nn.Module):
-    def __init__(self, module_list):
-        super().__init__()
-        self.module_list = module_list
-        self.in_features = sum([module.in_features for module in module_list])
-        self.out_features = module_list[0].out_features
-        self.has_bias = module_list[0].bias is not None
-        self.concat_linear = nn.Linear(self.in_features, self.out_features, self.has_bias)
-
-    def init_weight(self, x):
-        concat_weight = torch.concat([module.weight for module in self.module_list], 0)
-        concat_bias = torch.concat([module.bias for module in self.module_list], 0) if self.has_bias else None
-        self.concat_linear.weight = nn.Parameter(concat_weight)
-        self.concat_linear.bias = nn.Parameter(concat_bias) # if concat_bias is not None else None
-        self = ipex.optimize(self)
-
-    def forward(self, x):
-        if self.concat_linear is None:
-            self.init_weight(x)
-
-        return self.concat_linear(x)
-
-
 class IPEXLlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -326,16 +303,6 @@ class IPEXLlamaAttention(nn.Module):
             elif hasattr(mod, "weight") and hasattr(mod.weight, "shape"):
                 return list(mod.weight.shape)
             return None
-
-        self.concat_qkv = None
-        weight_shapes = [
-            get_weight_shape(mod)
-            for mod in [self.q_proj, self.k_proj, self.v_proj]
-        ]
-        if weight_shapes[0] is not None and all(
-            weight_shapes[0] == shape for shape in weight_shapes[1:]
-        ) and False:
-            self.concat_qkv = LlamaConcatLayer([self.q_proj, self.k_proj, self.v_proj])
 
         self.ipex_scale_dot_product = IndirectKVCache(text_max_length=self.max_position_embeddings)
 
