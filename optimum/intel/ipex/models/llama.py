@@ -433,7 +433,7 @@ class IPEXLlamaAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-class LlamaDecoderLayer(nn.Module):
+class IPEXLlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, distributed: bool = False):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -540,7 +540,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
     config_class = LlamaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["LlamaDecoderLayer"]
+    _no_split_modules = ["IPEXLlamaDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
 
@@ -626,7 +626,7 @@ LLAMA_INPUTS_DOCSTRING = r"""
 )
 class LlamaModel(LlamaPreTrainedModel):
     """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`IPEXLlamaDecoderLayer`]
 
     Args:
         config: LlamaConfig
@@ -638,7 +638,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([IPEXLlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
