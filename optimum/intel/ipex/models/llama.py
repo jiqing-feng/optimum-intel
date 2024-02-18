@@ -970,30 +970,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         )
         return model_inputs
 
-    @staticmethod
-    def _reorder_cache(
-        self, past_key_values: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor
-    ) -> Tuple[Tuple[torch.Tensor]]:
-        if (
-            len(past_key_values[0]) == 4 and past_key_values[0][0].shape[-1] == 1
-        ):  # discrete kv_cache
-            for layer_past in past_key_values:
-                layer_past[3][layer_past[0].size(-2) - 1] = beam_idx
-            return past_key_values
-        elif len(past_key_values[0]) == 8:
-            for layer_past in past_key_values:
-                layer_past[3][layer_past[0].size(-2) - 1] = beam_idx
-                layer_past[7][layer_past[0].size(-2) - 1] = beam_idx
-            return past_key_values
-        else:
-            return tuple(
-                tuple(
-                    past_state.index_select(0, beam_idx.to(past_state.device))
-                    for past_state in layer_past
-                )
-                for layer_past in past_key_values
-            )
-
     def _extract_past_from_model_output(
         self, outputs, standardize_cache_format: bool = False
     ):

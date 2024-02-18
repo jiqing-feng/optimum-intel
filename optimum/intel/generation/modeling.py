@@ -257,6 +257,7 @@ class BaseModelForCausalLM(OptimizedModel, GenerationMixin):
         return self
 
     def prepare_past_key_values(self, input_ids):
+        model_type = self.config.model_type.replace("_", "-")
         nb_pkv = 2
         num_layers = self.normalized_config.num_layers
         d_k = self.normalized_config.hidden_size // self.normalized_config.num_attention_heads
@@ -312,7 +313,6 @@ class BaseModelForCausalLM(OptimizedModel, GenerationMixin):
         if "position_ids" in self.input_names or not self.input_names:
             inputs["position_ids"] = position_ids
 
-        model_type = self.config.model_type.replace("_", "-")
         if self.use_cache:
             if past_key_values is None:
                 past_key_values = self.prepare_past_key_values(input_ids)
