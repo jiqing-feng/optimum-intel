@@ -29,6 +29,8 @@ from .modeling_utils import (
     _llama_model_forward,
 )
 
+from modeling.utils import _IPEXPatcher
+
 
 _IPEX_EXPORTED_ARCH = ("LlamaForCausalLM",)
 _IPEX_EXPORTED_TASK = ("text-generation",)
@@ -86,6 +88,8 @@ def _patch_llama_model(model):
 
 
 def _patch_model(model):
-    if isinstance(model, LlamaForCausalLM):
-        model = _patch_llama_model(model)
+    # if isinstance(model, LlamaForCausalLM):
+        # model = _patch_llama_model(model)
+    _IPEXPatcher.patch_model(model)
+        
     return model
