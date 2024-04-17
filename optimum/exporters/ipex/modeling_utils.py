@@ -23,11 +23,13 @@ from transformers.models.llama.modeling_llama import repeat_kv
 
 from optimum.intel.utils.import_utils import is_ipex_version
 
+if is_ipex_version("<", "2.3.0"):
+    raise ImportError("Only ipex version > 2.3.0 supports ipex.llm")
+from intel_extension_for_pytorch.llm.functional import rms_norm, rotary_embedding, indirect_access_kv_cache_attention
+from intel_extension_for_pytorch.llm.modules import Linear2SiluMul, LinearAdd
 
-# Adapted from https://github.com/huggingface/transformers/blob/v4.38.2/src/transformers/models/llama/modeling_llama.py#L83
 def _llama_layer_norm_forward(self, hidden_states):
-    return torch.ops.torch_ipex.rmsnorm(hidden_states, self.weight, self.variance_epsilon)
-
+    return rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
 # Adapted from https://github.com/huggingface/transformers/blob/v4.38.2/src/transformers/models/llama/modeling_llama.py#L321
 def _llama_attn_forward(
@@ -46,12 +48,20 @@ def _llama_attn_forward(
     key = self.k_proj(hidden_states)
     value = self.v_proj(hidden_states)
 
-    kv_seq_len = q_len + past_key_value[0].size(-2) if past_key_value is not None else q_len
-
     query = query.view(bsz, q_len, self.num_heads, self.head_dim)
     key = key.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
     value = value.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-    # Use ipex op to rotary position embedding more efficient.
+    # print(f"bsz, q_len, self.num_heads, self.head_dim {bsz}, {q_len}, {self.num_heads}, {self.head_dim}")
+    # print(f"query shape {query.shape}")
+    cos, sin = self.rotary_emb(value, position_ids)
+    sin = sin[:, None, :, :]
+    cos = cos[:, None, :, :]
+    query_new, key_new = rotary_embedding(query, key, sin, cos,
+        rotary_dim=self.head_dim,
+        rotary_half=True,
+        position_ids=position_ids)
+
+    kv_seq_len = q_len + past_key_value[0].size(-2) if past_key_value is not None else q_len
     key = self.ipex_rope(
         key,
         position_ids,
@@ -70,11 +80,17 @@ def _llama_attn_forward(
         self.head_dim,
         kv_seq_len,
     )
+    # Use ipex op to rotary position embedding more efficient.
+    print(query_new==query)
+    
+    # if past_key_value is not None: import pdb; pdb.set_trace()
 
+    # print(use_cache)
     if use_cache:
         # This ipex op pre-allocates buffers for past_key_values and use beam index history
         # which to decide which beam should be used to make attention scale dot more efficient.
-        (attn_output, attn_weights, past_key_value) = self.ipex_scale_dot_product(
+        # print(past_key_value)
+        (attn_output, attn_weights, past_key_value) = indirect_access_kv_cache_attention(
             query,
             key,
             value,
@@ -82,12 +98,12 @@ def _llama_attn_forward(
             past_key_value,
             None,
             attention_mask,
+            text_max_length=self.config.max_position_embeddings
         )
     else:
         value_states = value.transpose(1, 2)
         query_states = query.transpose(1, 2)
         key_states = key.transpose(1, 2)
-        kv_seq_len = key_states.shape[-2]
 
         past_key_value = None
         # repeat k/v heads if n_kv_heads < n_heads
@@ -219,11 +235,6 @@ def _llama_model_forward(
 # Adapted from https://github.com/huggingface/transformers/blob/v4.38.2/src/transformers/models/llama/modeling_llama.py#L694
 class _IPEXLlamaDecoderLayerRef(nn.Module):
     def __init__(self, module, config, distributed=False):
-        if is_ipex_version("<", "2.5.0"):
-            raise ImportError("Only ipex version > 2.3.0 supports Linear2SiluMul and LinearAdd")
-
-        from intel_extension_for_pytorch.llm.modules import Linear2SiluMul, LinearAdd
-
         super().__init__()
         for k, v in module.__dict__.items():
             setattr(self, k, v)
