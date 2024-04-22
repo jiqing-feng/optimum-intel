@@ -20,6 +20,7 @@ import unittest
 from typing import Dict
 
 import numpy as np
+import pytest
 import requests
 import timm
 import torch
@@ -53,6 +54,7 @@ from transformers import (
     set_seed,
 )
 from transformers.onnx.utils import get_preprocessor
+from transformers.testing_utils import slow
 from utils_tests import MODEL_NAMES
 
 from optimum.intel import (
@@ -61,6 +63,7 @@ from optimum.intel import (
     OVModelForAudioXVector,
     OVModelForCausalLM,
     OVModelForCTC,
+    OVModelForCustomTasks,
     OVModelForFeatureExtraction,
     OVModelForImageClassification,
     OVModelForMaskedLM,
@@ -364,6 +367,8 @@ class OVModelForQuestionAnsweringIntegrationTest(unittest.TestCase):
         gc.collect()
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
+    @pytest.mark.run_slow
+    @slow
     def test_pipeline(self, model_arch):
         model_id = MODEL_NAMES[model_arch]
         model = OVModelForQuestionAnswering.from_pretrained(model_id, export=True)
@@ -379,6 +384,8 @@ class OVModelForQuestionAnsweringIntegrationTest(unittest.TestCase):
         del model
         gc.collect()
 
+    @pytest.mark.run_slow
+    @slow
     def test_metric(self):
         model_id = "distilbert-base-cased-distilled-squad"
         set_seed(SEED)
@@ -431,6 +438,8 @@ class OVModelForTokenClassificationIntegrationTest(unittest.TestCase):
         gc.collect()
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
+    @pytest.mark.run_slow
+    @slow
     def test_pipeline(self, model_arch):
         model_id = MODEL_NAMES[model_arch]
         model = OVModelForTokenClassification.from_pretrained(model_id, export=True)
@@ -481,6 +490,8 @@ class OVModelForFeatureExtractionIntegrationTest(unittest.TestCase):
         gc.collect()
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
+    @pytest.mark.run_slow
+    @slow
     def test_pipeline(self, model_arch):
         model_id = MODEL_NAMES[model_arch]
         model = OVModelForFeatureExtraction.from_pretrained(model_id, export=True)
@@ -524,10 +535,12 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
         "stablelm",
         "starcoder2",
         "phi",
+        "internlm2",
+        "orion",
+        "falcon",
     )
     GENERATION_LENGTH = 100
-    IS_SUPPORT_STATEFUL = is_openvino_version(">=", "2023.3")
-    REMOTE_CODE_MODELS = ("chatglm", "minicpm", "baichuan2", "jais", "qwen")
+    REMOTE_CODE_MODELS = ("chatglm", "minicpm", "baichuan2", "jais", "qwen", "internlm2", "olmo", "orion")
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
     def test_compare_to_transformers(self, model_arch):
@@ -551,37 +564,63 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
         ov_model = OVModelForCausalLM.from_pretrained(model_id, export=True, ov_config=F32_CONFIG, **model_kwargs)
         self.assertIsInstance(ov_model.config, PretrainedConfig)
         self.assertTrue(ov_model.use_cache)
-        self.assertEqual(
-            ov_model.stateful, self.IS_SUPPORT_STATEFUL and ov_model.config.model_type not in not_stateful
-        )
-        set_seed(SEED)
-        transformers_model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+        self.assertEqual(ov_model.stateful, ov_model.config.model_type not in not_stateful)
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=model_arch in self.REMOTE_CODE_MODELS)
-        if model_arch == "qwen":
-            transformers_model.to(torch.float32)
-        tokens = tokenizer(
-            "This is a sample", return_tensors="pt", return_token_type_ids=False if model_arch == "llama" else None
-        )
-        ov_outputs = ov_model(**tokens)
+        tokens = tokenizer("This is a sample output", return_tensors="pt")
 
+        ov_outputs = ov_model(**tokens)
         self.assertTrue("logits" in ov_outputs)
         self.assertIsInstance(ov_outputs.logits, torch.Tensor)
         self.assertTrue("past_key_values" in ov_outputs)
         self.assertIsInstance(ov_outputs.past_key_values, tuple)
-        is_stateful = ov_model.config.model_type not in not_stateful and self.IS_SUPPORT_STATEFUL
+        is_stateful = ov_model.config.model_type not in not_stateful
         self.assertEqual(ov_model.stateful, is_stateful)
         if is_stateful:
             self.assertTrue(len(ov_outputs.past_key_values) == 1 and len(ov_outputs.past_key_values[0]) == 0)
+
+        set_seed(SEED)
+        transformers_model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+        if model_arch == "qwen":
+            transformers_model.to(torch.float32)
+
         with torch.no_grad():
             transformers_outputs = transformers_model(**tokens)
 
         # Compare tensor outputs
         self.assertTrue(torch.allclose(ov_outputs.logits, transformers_outputs.logits, equal_nan=True, atol=1e-4))
+
+        # Qwen tokenizer does not support padding
+        if model_arch == "qwen":
+            return
+
+        if model_arch != "chatglm":
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        # Compare batched generation
+        tokenizer.padding_side = "left"
+        tokens = tokenizer(["Today is a nice day and I am longer", "This is me"], return_tensors="pt", padding=True)
+        ov_model.generation_config.eos_token_id = None
+        transformers_model.generation_config.eos_token_id = None
+        ov_model.config.eos_token_id = None
+        transformers_model.config.eos_token_id = None
+        gen_config = GenerationConfig(
+            max_new_tokens=30,
+            min_new_tokens=30,
+            num_beams=3,
+            do_sample=False,
+            eos_token_id=None,
+        )
+
+        ov_outputs = ov_model.generate(**tokens, generation_config=gen_config)
+        transformers_outputs = transformers_model.generate(**tokens, generation_config=gen_config)
+        self.assertTrue(torch.allclose(ov_outputs, transformers_outputs))
+
         del transformers_model
         del ov_model
         gc.collect()
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
+    @pytest.mark.run_slow
+    @slow
     def test_pipeline(self, model_arch):
         model_kwargs = {}
         model_id = MODEL_NAMES[model_arch]
@@ -611,30 +650,6 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
         del model
         gc.collect()
 
-    @parameterized.expand(SUPPORTED_ARCHITECTURES)
-    def test_multiple_inputs(self, model_arch):
-        model_id = MODEL_NAMES[model_arch]
-        set_seed(SEED)
-        if model_arch == "qwen":
-            self.skipTest("Qwen tokenizer does not support padding")
-        model_kwargs = {}
-        if model_arch in self.REMOTE_CODE_MODELS:
-            model_kwargs = {
-                "config": AutoConfig.from_pretrained(model_id, trust_remote_code=True),
-                "trust_remote_code": True,
-            }
-        model = OVModelForCausalLM.from_pretrained(model_id, export=True, compile=False, **model_kwargs)
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=model_arch in self.REMOTE_CODE_MODELS)
-        tokenizer.pad_token = tokenizer.eos_token
-        texts = ["this is a simple input", "this is a second simple input", "this is a third simple input"]
-        tokens = tokenizer(texts, padding=True, return_tensors="pt")
-        generation_config = GenerationConfig(encoder_no_repeat_ngram_size=0, max_new_tokens=20, num_beams=2)
-        outputs = model.generate(**tokens, generation_config=generation_config)
-        self.assertIsInstance(outputs, torch.Tensor)
-        self.assertEqual(outputs.shape[0], 3)
-        del model
-        gc.collect()
-
     def test_model_and_decoder_same_device(self):
         model_id = MODEL_NAMES["gpt2"]
         model = OVModelForCausalLM.from_pretrained(model_id, export=True)
@@ -660,12 +675,11 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
         self.assertTrue(torch.equal(outputs_model_with_pkv, outputs_model_without_pkv))
         self.assertEqual(outputs_model_with_pkv.shape[1], self.GENERATION_LENGTH)
         self.assertEqual(outputs_model_without_pkv.shape[1], self.GENERATION_LENGTH)
-        if self.IS_SUPPORT_STATEFUL:
-            model_stateful = OVModelForCausalLM.from_pretrained(model_id, export=True, use_cache=True, stateful=True)
-            outputs_model_stateful = model_stateful.generate(
-                **tokens, min_length=self.GENERATION_LENGTH, max_length=self.GENERATION_LENGTH, num_beams=1
-            )
-            self.assertTrue(torch.equal(outputs_model_without_pkv, outputs_model_stateful))
+        model_stateful = OVModelForCausalLM.from_pretrained(model_id, export=True, use_cache=True, stateful=True)
+        outputs_model_stateful = model_stateful.generate(
+            **tokens, min_length=self.GENERATION_LENGTH, max_length=self.GENERATION_LENGTH, num_beams=1
+        )
+        self.assertTrue(torch.equal(outputs_model_without_pkv, outputs_model_stateful))
 
         del model_with_pkv
         del model_without_pkv
@@ -844,6 +858,8 @@ class OVModelForImageClassificationIntegrationTest(unittest.TestCase):
         gc.collect()
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
+    @pytest.mark.run_slow
+    @slow
     def test_pipeline(self, model_arch):
         model_id = MODEL_NAMES[model_arch]
         model = OVModelForImageClassification.from_pretrained(model_id, export=True)
@@ -974,6 +990,8 @@ class OVModelForSeq2SeqLMIntegrationTest(unittest.TestCase):
         gc.collect()
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
+    @pytest.mark.run_slow
+    @slow
     def test_generate_utils(self, model_arch):
         model_id = MODEL_NAMES[model_arch]
         model = OVModelForSeq2SeqLM.from_pretrained(model_id, export=True)
@@ -1431,6 +1449,8 @@ class OVModelForVision2SeqIntegrationTest(unittest.TestCase):
         self.assertIn("only supports the tasks", str(context.exception))
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
+    @pytest.mark.run_slow
+    @slow
     def test_generate_utils(self, model_arch: str):
         model_id = MODEL_NAMES[model_arch]
         model = OVModelForVision2Seq.from_pretrained(model_id, export=True)
@@ -1505,4 +1525,88 @@ class OVModelForVision2SeqIntegrationTest(unittest.TestCase):
         self.assertEqual(pipe.device, ov_model.device)
         self.assertIsInstance(outputs[0]["generated_text"], str)
 
+        gc.collect()
+
+
+class OVModelForCustomTasksIntegrationTest(unittest.TestCase):
+    SUPPORTED_ARCHITECTURES_WITH_ATTENTION = ["vit-with-attentions"]
+    SUPPORTED_ARCHITECTURES_WITH_HIDDEN_STATES = ["vit-with-hidden-states"]
+
+    def _get_sample_image(self):
+        url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+        image = Image.open(requests.get(url, stream=True).raw)
+        return image
+
+    @parameterized.expand(SUPPORTED_ARCHITECTURES_WITH_ATTENTION)
+    def test_compare_output_attentions(self, model_arch):
+        model_id = MODEL_NAMES[model_arch]
+
+        image = self._get_sample_image()
+        preprocessor = AutoFeatureExtractor.from_pretrained(model_id)
+        inputs = preprocessor(images=image, return_tensors="pt")
+
+        transformers_model = AutoModelForImageClassification.from_pretrained(model_id)
+        transformers_model.eval()
+        with torch.no_grad():
+            transformers_outputs = transformers_model(**inputs, output_attentions=True)
+
+        ov_model = OVModelForCustomTasks.from_pretrained(model_id, ov_config=F32_CONFIG)
+        self.assertIsInstance(ov_model.config, PretrainedConfig)
+
+        for input_type in ["pt", "np"]:
+            inputs = preprocessor(images=image, return_tensors=input_type)
+            ov_outputs = ov_model(**inputs)
+            self.assertIn("logits", ov_outputs)
+            self.assertIsInstance(ov_outputs.logits, TENSOR_ALIAS_TO_TYPE[input_type])
+            self.assertTrue(torch.allclose(torch.Tensor(ov_outputs.logits), transformers_outputs.logits, atol=1e-4))
+            self.assertTrue(len(ov_outputs.attentions) == len(transformers_outputs.attentions))
+            for i in range(len(ov_outputs.attentions)):
+                self.assertTrue(
+                    torch.allclose(
+                        torch.Tensor(ov_outputs.attentions[i]),
+                        transformers_outputs.attentions[i],
+                        atol=1e-4,  # attentions are accurate
+                        rtol=1e-4,  # attentions are accurate
+                    ),
+                    f"Attention mismatch at layer {i}",
+                )
+
+        del transformers_model
+        del ov_model
+        gc.collect()
+
+    @parameterized.expand(SUPPORTED_ARCHITECTURES_WITH_HIDDEN_STATES)
+    def test_compare_output_hidden_states(self, model_arch):
+        model_id = MODEL_NAMES[model_arch]
+
+        image = self._get_sample_image()
+        preprocessor = AutoFeatureExtractor.from_pretrained(model_id)
+        inputs = preprocessor(images=image, return_tensors="pt")
+
+        transformers_model = AutoModelForImageClassification.from_pretrained(model_id)
+        transformers_model.eval()
+        with torch.no_grad():
+            transformers_outputs = transformers_model(**inputs, output_hidden_states=True)
+
+        ov_model = OVModelForCustomTasks.from_pretrained(model_id, ov_config=F32_CONFIG)
+        self.assertIsInstance(ov_model.config, PretrainedConfig)
+        for input_type in ["pt", "np"]:
+            inputs = preprocessor(images=image, return_tensors=input_type)
+            ov_outputs = ov_model(**inputs)
+            self.assertIn("logits", ov_outputs)
+            self.assertIsInstance(ov_outputs.logits, TENSOR_ALIAS_TO_TYPE[input_type])
+            self.assertTrue(torch.allclose(torch.Tensor(ov_outputs.logits), transformers_outputs.logits, atol=1e-4))
+            self.assertTrue(len(ov_outputs.hidden_states) == len(transformers_outputs.hidden_states))
+            for i in range(len(ov_outputs.hidden_states)):
+                self.assertTrue(
+                    torch.allclose(
+                        torch.Tensor(ov_outputs.hidden_states[i]),
+                        transformers_outputs.hidden_states[i],
+                        atol=1e-3,  # hidden states are less accurate
+                        rtol=1e-2,  # hidden states are less accurate
+                    ),
+                    f"Hidden states mismatch at layer {i}",
+                )
+        del transformers_model
+        del ov_model
         gc.collect()
