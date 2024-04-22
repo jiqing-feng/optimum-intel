@@ -26,7 +26,7 @@ import openvino
 import torch
 import transformers
 from nncf import CompressWeightsMode, SensitivityMetric
-from nncf.quantization.advanced_parameters import AdvancedSmoothQuantParameters
+from nncf.quantization.advanced_parameters import AdvancedSmoothQuantParameters, OverflowFix
 from nncf.torch import register_module
 from nncf.torch.initialization import PTInitializingDataLoader
 from openvino._offline_transformations import compress_quantize_weights_transformation
@@ -280,13 +280,18 @@ class OVQuantizer(OptimumQuantizer):
             raise TypeError(f"`ov_config` should be an `OVConfig`, but got: {type(ov_config)} instead.")
         quantization_config = ov_config.quantization_config
         if quantization_config is None:
-            if weights_only is None or weights_only is True:
+            if (weights_only is None or weights_only is True) and calibration_dataset is None:
                 if weights_only is None:
                     logger.info(
                         "`quantization_config` was not provided, 8-bit asymmetric weight quantization will be applied."
                     )
                 ov_config.quantization_config = OVWeightQuantizationConfig(bits=8)
             else:
+                logger.warning(
+                    "`quantization_config` was not provided, but calibration dataset was provided, assuming full "
+                    "model quantization is intended. In the future, please provide `quantization_config` as an "
+                    "instance of OVQuantizationConfig."
+                )
                 ov_config.quantization_config = OVQuantizationConfig()
 
         if isinstance(self.model, OVBaseModel):
@@ -378,10 +383,12 @@ class OVQuantizer(OptimumQuantizer):
             quantization_dataset,
             subset_size=quantization_config.num_samples,
             ignored_scope=quantization_config.get_ignored_scope_instance(),
-            model_type=quantization_config.model_type,
-            preset=quantization_config.preset,
+            model_type=nncf.ModelType(quantization_config.model_type),
+            preset=nncf.QuantizationPreset.PERFORMANCE if quantization_config.sym else nncf.QuantizationPreset.MIXED,
             fast_bias_correction=quantization_config.fast_bias_correction,
-            advanced_parameters=nncf.AdvancedQuantizationParameters(overflow_fix=quantization_config.overflow_fix),
+            advanced_parameters=nncf.AdvancedQuantizationParameters(
+                overflow_fix=OverflowFix(quantization_config.overflow_fix)
+            ),
             **kwargs,
         )
         self.model.model = quantized_model
@@ -476,10 +483,14 @@ class OVQuantizer(OptimumQuantizer):
                 quantization_dataset,
                 subset_size=quantization_config.num_samples,
                 ignored_scope=quantization_config.get_ignored_scope_instance(),
-                model_type=quantization_config.model_type,
-                preset=quantization_config.preset,
+                model_type=nncf.ModelType(quantization_config.model_type),
+                preset=nncf.QuantizationPreset.PERFORMANCE
+                if quantization_config.sym
+                else nncf.QuantizationPreset.MIXED,
                 fast_bias_correction=quantization_config.fast_bias_correction,
-                advanced_parameters=nncf.AdvancedQuantizationParameters(overflow_fix=quantization_config.overflow_fix),
+                advanced_parameters=nncf.AdvancedQuantizationParameters(
+                    overflow_fix=OverflowFix(quantization_config.overflow_fix)
+                ),
                 **kwargs,
             )
 
