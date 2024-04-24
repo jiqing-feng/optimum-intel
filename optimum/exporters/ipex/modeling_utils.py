@@ -191,11 +191,15 @@ def _llama_model_forward(
     all_self_attns = () if output_attentions else None
     next_decoder_cache = () if use_cache else None
 
+    # XPU
+    if True:
+        past_key_values = []
+
     for idx, decoder_layer in enumerate(self.layers):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        past_key_value = past_key_values[idx] if past_key_values is not None else None
+        past_key_value = past_key_values[idx] if past_key_values is not None and len(past_key_values) > idx else None
 
         layer_outputs = decoder_layer(
             hidden_states,
