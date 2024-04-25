@@ -18,7 +18,7 @@ class _IPEXLlamaAttention(nn.Module):
         self.config = config
         self.distributed = distributed
 
-    def preprocess_for_optimize(self, hidden_states, layer_past, **kwargs):
+    def epreprocess_for_optimize(self, hidden_states, layer_past, **kwargs):
         pass
 
     def qkv_gemm(self, hidden_states, **kwargs):
