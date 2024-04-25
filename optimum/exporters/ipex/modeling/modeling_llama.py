@@ -156,10 +156,11 @@ class _IPEXLlamaDecoderLayer(nn.Module):
         **kwargs
     ):
         outputs = (hidden_states,)
-        if output_attention:
-            outputs += (self_attn_weight,)
         if use_cache:
             outputs += (present_key_value,)
+        if output_attention:
+            outputs += (self_attn_weight,)
+
         return outputs
 
 
@@ -201,7 +202,7 @@ class _IPEXLlamaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weight, present_key_value = self.attn(
+        hidden_states, present_key_value, self_attn_weight = self.attn(
             hidden_states,
             attention_mask,
             position_ids,
@@ -223,7 +224,7 @@ class _IPEXLlamaDecoderLayer(nn.Module):
             use_cache,
             self_attn_weight,
             present_key_value,
-            kwargs
+            **kwargs
         )
 
         return outputs

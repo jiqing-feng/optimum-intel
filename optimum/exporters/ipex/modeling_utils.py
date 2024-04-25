@@ -110,7 +110,7 @@ def _llama_attn_forward(
     if not output_attentions:
         attn_weights = None
 
-    return attn_output, attn_weights, past_key_value
+    return attn_output, past_key_value, attn_weights
 
 def padding_attn_mask(attn_mask, alignment):
     if attn_mask is None:
@@ -192,8 +192,8 @@ def _llama_model_forward(
     next_decoder_cache = () if use_cache else None
 
     # XPU
-    if True:
-        past_key_values = []
+    #if True:
+    #    past_key_values = []
 
     for idx, decoder_layer in enumerate(self.layers):
         if output_hidden_states:
@@ -289,7 +289,7 @@ class _IPEXLlamaDecoderLayerRef(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states, present_key_value, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,

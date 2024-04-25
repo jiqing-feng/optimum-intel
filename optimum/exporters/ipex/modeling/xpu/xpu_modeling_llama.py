@@ -79,27 +79,27 @@ class _IPEXLlamaAttentionXPU(_IPEXLlamaAttention):
         bs, seqlen, _ = hidden_states.size()
         prev_seqlen = 0
         if past_key_value:
-            _, prev_seqlen, _, _ = past_key_value[0].size()
+            _, _, prev_seqlen, _ = past_key_value[0].size()
         if self.num_kv_heads == self.num_heads:
-            query = torch.empty((bs, prev_seqlen + seqlen, self.num_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
+            query = torch.empty((bs, seqlen, self.num_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
             key = torch.empty((bs, prev_seqlen + seqlen, self.num_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
             value = torch.empty((bs, prev_seqlen + seqlen, self.num_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
             torch.ops.torch_ipex.mm_qkv_out(
-                hidden_states, self.qkv_proj_weight, self.qkv_proj_bias, query[:, prev_seqlen:, :], key[:, prev_seqlen:, :], value[:, prev_seqlen:, :])
+                hidden_states, self.qkv_proj_weight, self.qkv_proj_bias, query, key[:, prev_seqlen:, :], value[:, prev_seqlen:, :])
         else:
-            query = torch.empty((bs, prev_seqlen + seqlen, self.num_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
+            query = torch.empty((bs, seqlen, self.num_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
             key = torch.empty((bs, prev_seqlen + seqlen, self.num_kv_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
             value = torch.empty((bs, prev_seqlen + seqlen, self.num_kv_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
             torch.ops.torch_ipex.mm_qkv_group_out(
                 hidden_states, self.qkv_proj_weight, self.qkv_proj_bias, query, key, value)
         if past_key_value:
-            key[:, :prev_seqlen, :] = past_key_value[0].tranpose(1, 2)
-            value[:, :prev_seqlen, :] = past_key_value[1].tranpose(1, 2)
+            key[:, :prev_seqlen, :] = past_key_value[0].transpose(1, 2).view(bs, prev_seqlen, -1)
+            value[:, :prev_seqlen, :] = past_key_value[1].transpose(1, 2).view(bs, prev_seqlen, -1)
 
         # rope
         #query = query.view([-1, seqlen, self.num_heads, self.head_dim])
         #key = key.view([-1, seqlen, self.num_kv_heads, self.head_dim])
-        #value = value.view([-1, seqlen, self.num_kv_heads, self.head_dim])
+        value = value.view([bs, prev_seqlen + seqlen, self.num_kv_heads, self.head_dim])
 
         query = self.ipex_rope(
             query,
@@ -171,6 +171,7 @@ class _IPEXLlamaMLPXPU(_IPEXLlamaMLP):
         self.mlp_impl = None
         if optimized_module is not None:
             self.mlp_impl = optimized_module
+        self.port_parameter(module)
 
     def forward(
         self,
@@ -182,14 +183,14 @@ class _IPEXLlamaMLPXPU(_IPEXLlamaMLP):
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
         """
-        up = torch.ops.torch_ipex.mm_silu(hidden_states, self.module.gate_proj.weight)
-        out = torch.ops.torch_ipex.mm_resmul(hidden_states, self.module.up_proj.weight, up)
-        out = matmul_add_add(out, self.module.down_proj.weight, self.module.down_proj.bias, residual)
+        up = torch.ops.torch_ipex.mm_silu(hidden_states, self.gate_proj_weight)
+        out = torch.ops.torch_ipex.mm_resmul(hidden_states, self.up_proj_weight, up)
+        out = matmul_add_add(out, self.down_proj_weight, self.down_proj_bias, residual)
         return out
 
 
     def port_parameter(self, module):
-        self.up_proj_weight = module.up_proj.weight.tranpose(0, 1).contiguous()
+        self.up_proj_weight = module.up_proj.weight.transpose(0, 1).contiguous()
         self.gate_proj_weight = module.gate_proj.weight.transpose(0, 1).contiguous()
         self.down_proj_weight = module.down_proj.weight.transpose(0, 1).contiguous()
         self.up_proj_bias = module.up_proj.bias
