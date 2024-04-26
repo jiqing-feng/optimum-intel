@@ -41,13 +41,7 @@ class _IPEXLlamaAttentionXPU(_IPEXLlamaAttention):
         self.embed_dim = module.config.hidden_size
         self.port_parameters(module)
         from intel_extension_for_pytorch.llm.modules import RotaryEmbedding
-
-        # self.ipex_rope = RotaryEmbedding(
-        #             module.config.max_position_embeddings,
-        #             module.config.hidden_size // module.config.num_attention_heads,
-        #             module.config.rope_theta,
-        #             module.config.architectures[0],
-        #                                                 )
+        
         self.ipex_rope = _IPEXRopeXPU(
             module.config.max_position_embeddings,
             module.config.hidden_size // module.config.num_attention_heads,
@@ -88,54 +82,25 @@ class _IPEXLlamaAttentionXPU(_IPEXLlamaAttention):
         if past_key_value:
             _, _, prev_seqlen, _ = past_key_value[0].size()
         if self.num_kv_heads == self.num_heads:
-            # query = torch.empty((bs, seqlen, self.num_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
-            # key = torch.empty((bs, prev_seqlen + seqlen, self.num_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
-            # value = torch.empty((bs, prev_seqlen + seqlen, self.num_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
             query = torch.empty_like(hidden_states)
             key = torch.empty_like(hidden_states)
             value = torch.empty_like(hidden_states)
             torch.ops.torch_ipex.mm_qkv_out(
                 hidden_states, self.qkv_proj_weight, self.qkv_proj_bias, query, key, value)
-            # torch.ops.torch_ipex.mm_qkv_out(
-            #     hidden_states, self.qkv_proj_weight, self.qkv_proj_bias, query, key[:, prev_seqlen:, :], value[:, prev_seqlen:, :])
         else:
             query = torch.empty((bs, seqlen, self.num_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
             key = torch.empty((bs, seqlen, self.num_kv_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
             value = torch.empty((bs, seqlen, self.num_kv_heads * self.head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
             torch.ops.torch_ipex.mm_qkv_group_out(
                 hidden_states, self.qkv_proj_weight, self.qkv_proj_bias, query, key, value)
-        # if past_key_value:
-        #     key[:, :prev_seqlen, :] = past_key_value[0].transpose(1, 2).view(bs, prev_seqlen, -1)
-        #     value[:, :prev_seqlen, :] = past_key_value[1].transpose(1, 2).view(bs, prev_seqlen, -1)
-        # rope
-        #query = query.view([-1, seqlen, self.num_heads, self.head_dim])
-        #key = key.view([-1, seqlen, self.num_kv_heads, self.head_dim])
-        # value = value.view([bs, prev_seqlen + seqlen, self.num_kv_heads, self.head_dim])
+
         query = query.view([bs, seqlen, self.num_heads, self.head_dim])
         key = key.view([bs, seqlen, self.num_kv_heads, self.head_dim])
         sin, cos = self.ipex_rope.get_sin_cos(seqlen, self.head_dim // 2)
         sin = sin.squeeze()[position_ids].unsqueeze(2)
         cos = cos.squeeze()[position_ids].unsqueeze(2)
         self.ipex_rope.apply_embedding(query, sin, cos, self.head_dim // 2, key)
-        # query = self.ipex_rope(
-        #     query,
-        #     position_ids,
-        #     self.num_kv_heads,
-        #     self.head_dim,
-        #     self.head_dim // 2,
-        #     self.head_dim,
-        #     seqlen,
-        # )
 
-        # key = self.ipex_rope(
-        #     key,
-        #     position_ids,
-        #     self.num_kv_heads,
-        #     self.head_dim,
-        #     self.head_dim // 2,
-        #     self.head_dim,
-        #     seqlen,
-        # )
         value = value.view([bs, seqlen, self.num_kv_heads, self.head_dim])
         if past_key_value is not None:
             value = torch.cat([past_key_value[1].transpose(1, 2), value], dim=1)
@@ -146,7 +111,6 @@ class _IPEXLlamaAttentionXPU(_IPEXLlamaAttention):
         present = (key, value) if use_cache else None
 
         scale = 1.0 / math.sqrt(self.head_dim)
-        # import pdb;pdb.set_trace()
         is_causal = False
         # if past_key_value is not None:
         #     is_causal = True
