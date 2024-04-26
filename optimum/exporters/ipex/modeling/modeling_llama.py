@@ -18,7 +18,7 @@ class _IPEXLlamaAttention(nn.Module):
         self.config = config
         self.distributed = distributed
 
-    def epreprocess_for_optimize(self, hidden_states, layer_past, **kwargs):
+    def preprocess_for_optimize(self, hidden_states, layer_past, **kwargs):
         pass
 
     def qkv_gemm(self, hidden_states, **kwargs):
@@ -200,7 +200,6 @@ class _IPEXLlamaDecoderLayer(nn.Module):
         (hidden_states, attention_mask, position_ids, past_key_value) = outputs
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-
         # Self Attention
         hidden_states, present_key_value, self_attn_weight = self.attn(
             hidden_states,
@@ -209,6 +208,7 @@ class _IPEXLlamaDecoderLayer(nn.Module):
             past_key_value,
             output_attentions,
             use_cache,
+            None,
             residual,
             **kwargs,
         )
