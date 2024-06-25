@@ -99,6 +99,7 @@ def ipex_jit_trace(model, task, use_cache):
         sample_inputs = prepare_jit_inputs(model, task, use_cache)
 
     model.config.return_dict = False
+    model._supports_cache_class = False
 
     if "past_key_values" in sample_inputs:
         model.config.use_cache = use_cache
@@ -416,6 +417,7 @@ class IPEXModelForQuestionAnswering(IPEXModel):
 class IPEXModelForCausalLM(IPEXModel, GenerationMixin):
     auto_model_class = AutoModelForCausalLM
     export_feature = "text-generation"
+    _supports_cache_class = False
 
     def __init__(
         self,
@@ -599,6 +601,21 @@ class IPEXModelForCausalLM(IPEXModel, GenerationMixin):
                 f"Assisted decoding is not supported for patched models for now, support methods are {_IPEX_EXPORTED_GENERATION_METHODS}"
             )
         return super().generate(*args, **kwargs)
+    
+    def _expand_outputs(self, outputs, expand_size):
+        outputs["logits"] = outputs["logits"].repeat_interleave(expand_size, dim=0)
+        if "past_key_values" in outputs:
+            new_pkv = []
+            for i in range(len(outputs["past_key_values"])):
+                new_pkv.append([])
+                new_pkv[-1].append(outputs["past_key_values"][i][0])
+                for j in range(1, 4):
+                    new_pkv[-1].append(outputs["past_key_values"][i][j].repeat_interleave(expand_size, dim=1))
+                new_pkv[-1] = tuple(new_pkv[-1])
+        new_pkv = tuple(new_pkv)
+        outputs["past_key_values"] = new_pkv
+
+        return outputs
 
 
 def _prepare_inputs_for_generation_for_llama(
