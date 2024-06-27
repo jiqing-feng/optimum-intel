@@ -23,6 +23,7 @@ from typing import Dict, Optional, Tuple, Union
 
 import intel_extension_for_pytorch as ipex
 import torch
+import transformers
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
 from intel_extension_for_pytorch.cpu._auto_kernel_selection import _enable_tpp
@@ -40,12 +41,14 @@ from transformers import (
     GenerationConfig,
     GenerationMixin,
     PretrainedConfig,
+    PreTrainedModel,
     is_torch_xpu_available,
 )
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
 from transformers.models.auto.auto_factory import _get_model_class as get_model_class
 from transformers.utils import WEIGHTS_NAME
+from transformers.generation.candidate_generator import _crop_past_key_values
 
 from optimum.exporters import TasksManager
 from optimum.modeling_base import OptimizedModel
@@ -106,18 +109,19 @@ def ipex_jit_trace(model, task, use_cache):
             sample_inputs.pop("past_key_values")
 
     model = ipex.optimize(model.eval(), dtype=model.dtype, inplace=True)
+    trace_model = model
     # Disable repack while jit tracing to reduce the memory
-    ipex._C.disable_jit_linear_repack()
-    with torch.no_grad():
-        trace_model = torch.jit.trace(
-            model,
-            example_kwarg_inputs=sample_inputs,
-            strict=False,
-            check_trace=False,
-        )
-        trace_model = torch.jit.freeze(trace_model)
-        trace_model(**sample_inputs)
-        trace_model(**sample_inputs)
+    # ipex._C.disable_jit_linear_repack()
+    # with torch.no_grad():
+    #     trace_model = torch.jit.trace(
+    #         model,
+    #         example_kwarg_inputs=sample_inputs,
+    #         strict=False,
+    #         check_trace=False,
+    #     )
+    #     trace_model = torch.jit.freeze(trace_model)
+    #     trace_model(**sample_inputs)
+    #     trace_model(**sample_inputs)
 
     return trace_model
 
@@ -157,7 +161,7 @@ class IPEXModel(OptimizedModel):
 
         OptimizedModel.__init__(self, model=model, config=config)
 
-        self.model.to(self._device)
+        # self.model.to(self._device)
         self._dtype = self.config.torch_dtype if self.config.torch_dtype is not None else torch.float32
         self.model_save_dir = model_save_dir
         self._is_ipex_exported = _is_patched_with_ipex(model, self.export_feature)
@@ -457,6 +461,8 @@ class IPEXModelForCausalLM(IPEXModel, GenerationMixin):
 
         if self._is_ipex_exported:
             self._reorder_cache = _ipex_reorder_cache
+            transformers.generation.candidate_generator._crop_past_key_values = _ipex_crop_past_key_values
+            transformers.generation.utils._crop_past_key_values = _ipex_crop_past_key_values
         else:
             # Check if _reorder_cache is a static method
             if isinstance(self.model_cls.__dict__["_reorder_cache"], staticmethod):
@@ -594,10 +600,10 @@ class IPEXModelForCausalLM(IPEXModel, GenerationMixin):
         return generation_config, model_kwargs
 
     def generate(self, *args, **kwargs):
-        if self._is_ipex_exported and kwargs.get("assistant_model", None):
-            raise ValueError(
-                f"Assisted decoding is not supported for patched models for now, support methods are {_IPEX_EXPORTED_GENERATION_METHODS}"
-            )
+        # if self._is_ipex_exported and kwargs.get("assistant_model", None):
+        #     raise ValueError(
+        #         f"Assisted decoding is not supported for patched models for now, support methods are {_IPEX_EXPORTED_GENERATION_METHODS}"
+        #     )
         return super().generate(*args, **kwargs)
 
 
@@ -678,3 +684,18 @@ def _ipex_reorder_cache(
             tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
             for layer_past in past_key_values
         )
+    
+
+def _ipex_crop_past_key_values(model, past_key_values, max_length):
+    if isinstance(model, IPEXModel):
+        new_past_key_values = []
+        for i in range(len(past_key_values)):
+            pkv = []
+            pkv.append(past_key_values[i][0][:, :max_length, :max_length, :])
+            pkv += [past_key_values[i][_] for _ in range(1, 4)]
+            new_past_key_values.append(tuple(pkv))
+        new_past_key_values = tuple(new_past_key_values)
+        return new_past_key_values
+    else:
+        _crop_past_key_values(model, past_key_values, max_length)
+        
