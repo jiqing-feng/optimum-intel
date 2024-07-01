@@ -27,7 +27,7 @@ import transformers
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
 from intel_extension_for_pytorch.cpu._auto_kernel_selection import _enable_tpp
-from intel_extension_for_pytorch.transformers.optimize import get_dummy_input
+# from intel_extension_for_pytorch.transformers.optimize import get_dummy_input
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -86,6 +86,27 @@ def _is_patched_with_ipex(model, task):
         )
 
 
+def get_dummy_input(model):
+    beam_idx_tmp = torch.zeros((8, 1), dtype=torch.long).contiguous()
+    past_key_values = tuple(
+        [
+            (
+                torch.zeros(1, 2, 2, 1, dtype=torch.long).contiguous(),
+                torch.zeros([8, 1, model.config.hidden_size, int(model.config.hidden_size / model.config.num_attention_heads)], dtype=model.dtype).contiguous(),
+                torch.zeros([8, 1, model.config.hidden_size, int(model.config.hidden_size / model.config.num_attention_heads)], dtype=model.dtype).contiguous(),
+                beam_idx_tmp,
+            )
+            for i in range(model.config.num_hidden_layers)
+        ]
+    )
+    input_ids = torch.ones([1, 4], dtype=torch.int64)
+    attention_mask = torch.ones([1, 6], dtype=torch.int64)
+    position_ids = torch.Tensor([[2, 3, 4, 5]]).to(torch.int64)
+
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "position_ids": position_ids, "past_key_values": past_key_values}
+
+
+
 def ipex_jit_trace(model, task, use_cache):
     # Only support torch version >= 2.1.0 to support example_kwarg_inputs in jit.trace
     if is_torch_version("<", "2.1.0"):
@@ -94,7 +115,7 @@ def ipex_jit_trace(model, task, use_cache):
     if _is_patched_with_ipex(model, task):
         model = _patch_model(model)
         # TODO: integerate in prepare_jit_inputs.
-        sample_inputs = get_dummy_input(model, return_dict=True)
+        sample_inputs = get_dummy_input(model)
         # Use Tensor Processing Primitives to accelerate linear, see https://arxiv.org/abs/2104.05755.
         _enable_tpp()
     else:
@@ -109,6 +130,7 @@ def ipex_jit_trace(model, task, use_cache):
             sample_inputs.pop("past_key_values")
 
     model = ipex.optimize(model.eval(), dtype=model.dtype, inplace=True)
+
     trace_model = model
     # Disable repack while jit tracing to reduce the memory
     # ipex._C.disable_jit_linear_repack()
