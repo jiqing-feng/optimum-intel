@@ -200,19 +200,7 @@ class _IPEXLlamaAttention(nn.Module):
         # This ipex op pre-allocates buffers for past_key_values and use beam index history
         # which to decide which beam should be used to make attention scale dot more efficient.
 
-        # (attn_output, attn_weights, past_key_value) = self.ipex_scale_dot_product(
-        #         query,
-        #         key,
-        #         value,
-        #         math.sqrt(self.head_dim),
-        #         past_key_value,
-        #         None,
-        #         attention_mask,
-        #     )
-
-        # 1st token with empty past key values
-        if past_key_value[0].size(-2) == 0:
-            (attn_output, attn_weights, past_key_value) = self.ipex_scale_dot_product(
+        (attn_output, attn_weights, past_key_value) = self.ipex_scale_dot_product(
                 query,
                 key,
                 value,
@@ -221,22 +209,34 @@ class _IPEXLlamaAttention(nn.Module):
                 None,
                 attention_mask,
             )
-        else:
-            query_length = query.shape[1]
-            # if query_length > 1: import pdb; pdb.set_trace()
-            attn_output_stack = []
-            for i in range(query_length):
-                (attn_output, attn_weights, past_key_value) = self.ipex_scale_dot_product(
-                    query[:, i:i+1],
-                    key[:, i:i+1],
-                    value[:, i:i+1],
-                    math.sqrt(self.head_dim),
-                    past_key_value,
-                    None,
-                    attention_mask,
-                )
-                attn_output_stack.append(attn_output)
-            attn_output = torch.concat(attn_output_stack, dim=-2)
+
+        # # 1st token with empty past key values
+        # if past_key_value[0].size(-2) == 0:
+        #     (attn_output, attn_weights, past_key_value) = self.ipex_scale_dot_product(
+        #         query,
+        #         key,
+        #         value,
+        #         math.sqrt(self.head_dim),
+        #         past_key_value,
+        #         None,
+        #         attention_mask,
+        #     )
+        # else:
+        #     query_length = query.shape[1]
+        #     # if query_length > 1: import pdb; pdb.set_trace()
+        #     attn_output_stack = []
+        #     for i in range(query_length):
+        #         (attn_output, attn_weights, past_key_value) = self.ipex_scale_dot_product(
+        #             query[:, i:i+1],
+        #             key[:, i:i+1],
+        #             value[:, i:i+1],
+        #             math.sqrt(self.head_dim),
+        #             past_key_value,
+        #             None,
+        #             attention_mask,
+        #         )
+        #         attn_output_stack.append(attn_output)
+        #     attn_output = torch.concat(attn_output_stack, dim=-2)
 
         return attn_output, past_key_value, attn_weights
 
