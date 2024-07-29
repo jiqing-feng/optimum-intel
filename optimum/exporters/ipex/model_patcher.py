@@ -79,14 +79,13 @@ def _patch_llama_model(model):
 
 
 def _patch_falcon_model(model):
-    replace_customized_linear_with_linear(model)
     model.transformer._use_sdpa = False
+    replace_customized_linear_with_linear(model)
     convert_class(model, FalconDecoderLayer, _IPEXFalconDecoderLayer, model.config)
     return model
 
 
 def _patch_gpt2_model(model):
-    replace_customized_linear_with_linear(model)
     model.transformer._attn_implementation = "eager"
     convert_class(model, GPT2Block, _IPEXGPT2Block, model.config)
     return model
