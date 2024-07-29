@@ -263,16 +263,9 @@ class _IPEXLlamaAttention(_IPEXAttention):
 
     def rope(self, query, key, kv_seq_len, use_cache, position_ids):
         if use_cache:
-            args = (
-                position_ids,
-                self.num_key_value_heads,
-                self.head_dim,
-                self.head_dim // 2,
-                self.head_dim,
-                kv_seq_len,
-            )
-            key = self.ipex_rope(key, *args)
-            query = self.ipex_rope(query, *args)
+            args = (self.head_dim, self.head_dim // 2, self.head_dim, kv_seq_len)
+            key = self.ipex_rope(key, position_ids, self.num_key_value_heads, *args)
+            query = self.ipex_rope(query, position_ids, self.num_heads, *args)
         return query, key
 
     # Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L341
@@ -337,7 +330,7 @@ class _IPEXFalconAttention(_IPEXAttention):
         attn_output = attn_output.view(bs, self.num_heads, q_len, self.head_dim).transpose(1, 2)
         attn_output = attn_output.reshape(bs, q_len, self.num_heads * self.head_dim)
 
-        return attn_output, past_key_value
+        return attn_output, past_key_value, None
 
 
 class _IPEXGPT2Attention(_IPEXAttention):
@@ -362,11 +355,10 @@ class _IPEXGPT2Attention(_IPEXAttention):
         return query, key
 
     def sdpa_without_cache(self, query, key, value, past_key_value, attention_mask, **kwargs):
-        attn_output, attn_weights = self._attn(query, key, value, attention_mask, kwargs.get("head_mask", None))
-        attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
-        past_key_value = None
+        query, key, value = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+        attn_output = F.scaled_dot_product_attention(query, key, value, attention_mask, 0.0, is_causal=True)
 
-        return attn_output, past_key_value
+        return attn_output, None, None
 
 
 # Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L186
