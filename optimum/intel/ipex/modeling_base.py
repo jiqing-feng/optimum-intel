@@ -92,7 +92,7 @@ def _prepare_inputs_for_ipex_model(model, task, use_cache):
         return prepare_jit_inputs(model, task, use_cache)
 
 
-def ipex_jit_trace(model, task, use_cache):
+def ipex_jit_trace(model, task, use_cache, export):
     # Only support torch version >= 2.1.0 to support example_kwarg_inputs in jit.trace
     if is_torch_version("<", "2.1.0"):
         raise ImportError("`torch>=2.1.0` is needed to trace your model")
@@ -100,34 +100,33 @@ def ipex_jit_trace(model, task, use_cache):
     if _is_patched_with_ipex(model, task):
         model = _patch_model(model)
 
-    sample_inputs = _prepare_inputs_for_ipex_model(model, task, use_cache)
-
-    model.config.return_dict = False
-
-    if "past_key_values" in sample_inputs:
-        model.config.use_cache = use_cache
-        if not use_cache:
-            sample_inputs.pop("past_key_values")
-
     # Use Tensor Processing Primitives to accelerate linear, see https://arxiv.org/abs/2104.05755.
     # Only ipex >= 2.3.0 supports tpp. The tpp is only verified for llm in generation tasks.
     if is_ipex_version(">=", "2.3.0") and task in _IPEX_EXPORTED_GENERATION_TASKS:
         _enable_tpp()
     model = ipex.optimize(model.eval(), dtype=model.dtype, inplace=True)
-    # Disable repack while jit tracing to reduce the memory
-    ipex._C.disable_jit_linear_repack()
-    with torch.no_grad():
-        trace_model = torch.jit.trace(
-            model,
-            example_kwarg_inputs=sample_inputs,
-            strict=False,
-            check_trace=False,
-        )
-        trace_model = torch.jit.freeze(trace_model)
-        trace_model(**sample_inputs)
-        trace_model(**sample_inputs)
 
-    return trace_model
+    if export:
+        sample_inputs = _prepare_inputs_for_ipex_model(model, task, use_cache)
+        model.config.return_dict = False
+        if "past_key_values" in sample_inputs:
+            model.config.use_cache = use_cache
+            if not use_cache:
+                sample_inputs.pop("past_key_values")
+        # Disable repack while jit tracing to reduce the memory
+        ipex._C.disable_jit_linear_repack()
+        with torch.no_grad():
+            model = torch.jit.trace(
+                model,
+                example_kwarg_inputs=sample_inputs,
+                strict=False,
+                check_trace=False,
+            )
+            model = torch.jit.freeze(model)
+            model(**sample_inputs)
+            model(**sample_inputs)
+
+    return model
 
 
 class IPEXModel(OptimizedModel):
@@ -154,14 +153,13 @@ class IPEXModel(OptimizedModel):
             self._device = torch.device("cpu")
 
         # CPU only support jit model for now.
-        if export:
-            if isinstance(model, torch.jit.RecursiveScriptModule):
-                logger.warning("The model has been exported already.")
-            else:
-                config = model.config if config is None else config
-                use_cache = kwargs.get("use_cache", True)
-                model = ipex_jit_trace(model, self.export_feature, use_cache)
-                config.torchscript = True
+        if export and isinstance(model, torch.jit.RecursiveScriptModule):
+            logger.warning("The model has been exported already.")
+        elif not isinstance(model, torch.jit.RecursiveScriptModule):
+            config = model.config if config is None else config
+            use_cache = kwargs.get("use_cache", True)
+            model = ipex_jit_trace(model, self.export_feature, use_cache, export)
+            config.torchscript = True
 
         OptimizedModel.__init__(self, model=model, config=config)
 
@@ -169,6 +167,7 @@ class IPEXModel(OptimizedModel):
         self._dtype = self.config.torch_dtype if self.config.torch_dtype is not None else torch.float32
         self.model_save_dir = model_save_dir
         self._is_ipex_exported = _is_patched_with_ipex(model, self.export_feature)
+        self.exported = True if isinstance(model, torch.jit.RecursiveScriptModule) else export
 
         if isinstance(model, torch.jit.RecursiveScriptModule):
             self.input_names = {
@@ -187,6 +186,7 @@ class IPEXModel(OptimizedModel):
 
     @classmethod
     def _from_transformers(cls, *args, **kwargs):
+        kwargs["export"] = True
         return cls._from_pretrained(*args, **kwargs)
 
     @classmethod
@@ -204,6 +204,7 @@ class IPEXModel(OptimizedModel):
         torch_dtype: Optional[Union[str, "torch.dtype"]] = None,
         trust_remote_code: bool = False,
         file_name: Optional[str] = WEIGHTS_NAME,
+        export: Optional[bool] = False,
         **kwargs,
     ):
         if use_auth_token is not None:
@@ -246,7 +247,7 @@ class IPEXModel(OptimizedModel):
                 **model_kwargs,
             )
 
-            return cls(model, config=config, export=True, **kwargs)
+            return cls(model, config=config, export=export, **kwargs)
 
         # Load the model from local directory
         if os.path.isdir(model_id):
@@ -580,7 +581,7 @@ class IPEXModelForCausalLM(IPEXModel, GenerationMixin):
             inputs["position_ids"] = position_ids
 
         if self.use_cache:
-            if past_key_values is None:
+            if past_key_values is None and self.exported:
                 past_key_values = self._prepare_past_key_values(input_ids)
 
             inputs["past_key_values"] = past_key_values
