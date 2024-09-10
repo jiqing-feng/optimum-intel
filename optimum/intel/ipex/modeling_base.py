@@ -134,25 +134,10 @@ def ipex_jit_trace(model, task, use_cache):
     model.config.return_dict = False
     model.config.use_cache = use_cache
 
-    # Use Tensor Processing Primitives to accelerate linear, see https://arxiv.org/abs/2104.05755.
-    # Only ipex >= 2.3.0 supports tpp. The tpp is only verified for llm in generation tasks.
-    if is_ipex_version(">=", "2.3.0") and task in _IPEX_EXPORTED_GENERATION_TASKS:
-        _enable_tpp()
-    model = ipex.optimize(model.eval(), dtype=model.dtype, inplace=True)
-    # Disable repack while jit tracing to reduce the memory
-    ipex._C.disable_jit_linear_repack()
-    with torch.no_grad():
-        trace_model = torch.jit.trace(
-            model,
-            example_kwarg_inputs=sample_inputs,
-            strict=False,
-            check_trace=False,
-        )
-        trace_model = torch.jit.freeze(trace_model)
-        trace_model(**sample_inputs)
-        trace_model(**sample_inputs)
+    model(**sample_inputs)
+    model.forward = torch.compile(model.forward, dynamic=True)
 
-    return trace_model
+    return model
 
 
 class IPEXModel(OptimizedModel):
@@ -646,9 +631,6 @@ class IPEXModelForCausalLM(IPEXModel, GenerationMixin):
             inputs["position_ids"] = position_ids
 
         if self.use_cache:
-            if past_key_values is None:
-                past_key_values = self._prepare_past_key_values(input_ids)
-
             inputs["past_key_values"] = past_key_values
 
         # 2. Model forward
