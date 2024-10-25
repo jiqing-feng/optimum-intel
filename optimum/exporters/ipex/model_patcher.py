@@ -33,6 +33,7 @@ from .modeling_utils import (
     _IPEXGPT2Attention,
     _IPEXIntermediate,
     _IPEXLlamaDecoderLayer,
+    _llama_model_forward,
 )
 
 
@@ -76,6 +77,7 @@ def _patch_llama_model(model):
         1. Use IPEX Rope and Paged cache
         2. Linear fusion with (2 Linears + Silu + Mul) and (Linear + Add)
     """
+    convert_functions(model, LlamaModel, "forward", _llama_model_forward)
     convert_functions(model, LlamaRMSNorm, "forward", _ipex_rms_layer_norm_forward)
     convert_class(model, LlamaDecoderLayer, _IPEXLlamaDecoderLayer, model.config)
     return model

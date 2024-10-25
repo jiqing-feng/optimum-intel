@@ -22,7 +22,7 @@ from transformers.cache_utils import Cache
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
-from transformers.models.llama.modeling_llama import repeat_kv
+from transformers.models.llama.modeling_llama import LlamaModel, repeat_kv
 
 from optimum.intel.utils.import_utils import is_ipex_version
 from optimum.intel.utils.modeling_utils import _setattr_from_module
@@ -40,7 +40,7 @@ if is_ipex_version("<", _IPEX_MINIMUM_VERSION_FOR_PATCHING):
         f"Please upgrade the IPEX version to at least {_IPEX_MINIMUM_VERSION_FOR_PATCHING} if you want to patch the model."
     )
 else:
-    from intel_extension_for_pytorch.llm.functional import rms_norm, rotary_embedding, varlen_attention
+    from intel_extension_for_pytorch.llm.functional import rms_norm, rotary_embedding
     from intel_extension_for_pytorch.llm.modules import (
         Linear2SiluMul,
         LinearAdd,
@@ -48,6 +48,16 @@ else:
         LinearGelu,
         PagedAttention,
     )
+
+
+# Adapted from https://github.com/huggingface/transformers/blob/v4.44.2/src/transformers/models/llama/modeling_llama.py#L918
+def _llama_model_forward(
+    self,
+    **kwargs,
+) -> Union[Tuple, BaseModelOutputWithPast]:
+    input_lens = kwargs.get("attention_mask").cumsum(-1)[:, -1].int()
+    setattr(kwargs.get("past_key_values"), "input_lens", input_lens)
+    return LlamaModel.forward(self, **kwargs)
 
 
 class XPULinear2SiluMul(torch.nn.Module):
@@ -157,6 +167,7 @@ class _IPEXAttention(nn.Module):
         past_key_value: Optional[IPEXPagedCache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        input_lens: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if past_key_value is None and kwargs.get("layer_past", None) is not None:
@@ -173,7 +184,9 @@ class _IPEXAttention(nn.Module):
             query, key, value = self.rope(qkv_out, **kwargs)
 
         if past_key_value is not None:
-            key_cache, value_cache = past_key_value.update(key, value, self.layer_idx, position_ids)
+            key_cache, value_cache = past_key_value.update(
+                key, value, self.layer_idx, position_ids, past_key_value.input_lens
+            )
 
         if past_len == 0:
             # # prefill, remove padding
@@ -210,7 +223,6 @@ class _IPEXAttention(nn.Module):
             attn_output = attn_output.view(bsz, q_len, -1)
         else:
             # decode
-            import pdb; pdb.set_trace()
             attn_output = torch.empty_like(query)
             input_lens = torch.ones(bsz).int() * past_len + 1
             PagedAttention.single_query_cached_kv_attention(

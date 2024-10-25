@@ -81,19 +81,19 @@ class IPEXPagedCache(Cache):
         value_states: torch.Tensor,
         layer_idx: int,
         batch_size: int,
-        input_len: int,
+        input_lens: torch.Tensor,
     ):
         if layer_idx == 0:
             all_block_indices = []
             all_slot_offsets = []
-            num_blocks = (input_len + self.block_size - 1) // self.block_size
+            num_blocks = (input_lens + self.block_size - 1) // self.block_size
             for i in range(batch_size):
-                for b_idx in range(num_blocks):
+                for b_idx in range(num_blocks[i]):
                     if self.block_tables[i][b_idx] == -1:
                         # need a free block
                         self.block_tables[i][b_idx] = self.free_blocks.pop(0)
 
-                slots_range = torch.arange(input_len, device=key_states.device)
+                slots_range = torch.arange(input_lens[i], device=key_states.device)
                 block_indices = slots_range // self.block_size
                 slot_offsets = slots_range % self.block_size
                 all_block_indices.append(self.block_tables[i][block_indices])
@@ -114,7 +114,7 @@ class IPEXPagedCache(Cache):
 
         # Update the number of seen tokens
         if layer_idx == self.num_hidden_layers - 1:
-            self._seen_tokens = self._seen_tokens + input_len
+            self._seen_tokens = self._seen_tokens + input_lens
             self.max_seq_len, _ = self._seen_tokens.max(dim=0)
 
     def update_for_decode(
@@ -155,6 +155,7 @@ class IPEXPagedCache(Cache):
         value_states: torch.Tensor,
         layer_idx: int,
         position_ids: torch.Tensor,
+        input_lens: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
@@ -170,10 +171,10 @@ class IPEXPagedCache(Cache):
             A tuple containing the updated key and value states.
         """
 
-        batch_size, input_len = position_ids.shape
+        batch_size = position_ids.shape[0]
         if self.get_seq_length() == 0:
             # prefill
-            self.update_for_prefill(key_states, value_states, layer_idx, batch_size, input_len)
+            self.update_for_prefill(key_states, value_states, layer_idx, batch_size, input_lens)
         else:
             # decode
             self.update_for_decode(key_states, value_states, layer_idx, batch_size)
