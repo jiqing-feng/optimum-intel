@@ -196,8 +196,9 @@ class _IPEXAttention(nn.Module):
 
         if past_len == 0:
             # # prefill, remove padding
-            key = repeat_kv(key, self.num_key_value_groups)
-            value = repeat_kv(value, self.num_key_value_groups)
+            query = query.transpose(1, 2)
+            key = repeat_kv(key.transpose(1, 2), self.num_key_value_groups)
+            value = repeat_kv(value.transpose(1, 2), self.num_key_value_groups)
 
             causal_mask = attention_mask
             if attention_mask is not None:
