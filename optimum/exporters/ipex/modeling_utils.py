@@ -57,6 +57,7 @@ def _llama_model_forward(
 ) -> Union[Tuple, BaseModelOutputWithPast]:
     input_lens = kwargs.get("attention_mask").cumsum(-1)[:, -1].int()
     setattr(kwargs.get("past_key_values"), "input_lens", input_lens)
+    setattr(kwargs.get("past_key_values"), "original_attn_mask", kwargs.get("attention_mask"))
     return LlamaModel.forward(self, **kwargs)
 
 
@@ -167,7 +168,6 @@ class _IPEXAttention(nn.Module):
         past_key_value: Optional[IPEXPagedCache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        input_lens: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if past_key_value is None and kwargs.get("layer_past", None) is not None:
@@ -184,37 +184,40 @@ class _IPEXAttention(nn.Module):
             query, key, value = self.rope(qkv_out, **kwargs)
 
         if past_key_value is not None:
+            key_cache = key.view(-1, self.num_key_value_heads, self.head_dim)
+            value_cache = value.view(-1, self.num_key_value_heads, self.head_dim)
+            if q_len > 1:
+                index = past_key_value.original_attn_mask.view(-1) != 0
+                key_cache = key_cache[index]
+                value_cache = value_cache[index]
             key_cache, value_cache = past_key_value.update(
-                key, value, self.layer_idx, position_ids, past_key_value.input_lens
+                key_cache, value_cache, self.layer_idx, position_ids, past_key_value.input_lens
             )
 
         if past_len == 0:
             # # prefill, remove padding
-            query_states = query.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-            key_states = key.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            value_states = value.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
+            key = repeat_kv(key, self.num_key_value_groups)
+            value = repeat_kv(value, self.num_key_value_groups)
 
             causal_mask = attention_mask
             if attention_mask is not None:
-                causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+                causal_mask = causal_mask[:, :, :, : key.shape[-2]]
 
             # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
             # Reference: https://github.com/pytorch/pytorch/issues/112577.
-            if query_states.device.type == "xpu" and causal_mask is not None:
-                query_states = query_states.contiguous()
-                key_states = key_states.contiguous()
-                value_states = value_states.contiguous()
+            if query.device.type == "xpu" and causal_mask is not None:
+                query = query.contiguous()
+                key = key.contiguous()
+                value = value.contiguous()
 
             # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
             # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
             is_causal = True if causal_mask is None and q_len > 1 else False
 
             attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
+                query,
+                key,
+                value,
                 attn_mask=causal_mask,
                 dropout_p=self.attention_dropout if self.training else 0.0,
                 is_causal=is_causal,
@@ -224,7 +227,6 @@ class _IPEXAttention(nn.Module):
         else:
             # decode
             attn_output = torch.empty_like(query)
-            input_lens = torch.ones(bsz).int() * past_len + 1
             PagedAttention.single_query_cached_kv_attention(
                 attn_output,
                 query,
@@ -233,9 +235,9 @@ class _IPEXAttention(nn.Module):
                 self.kv_head_mapping,
                 1.0 / math.sqrt(self.head_dim),
                 past_key_value.block_tables,
-                input_lens,
+                past_key_value.input_lens,
                 past_key_value.block_size,
-                input_lens.max(),
+                past_key_value.input_lens.max(),
                 None,
             )
             attn_output = attn_output.reshape(-1, attn_output.shape[-2] * attn_output.shape[-1])
@@ -273,10 +275,11 @@ class _IPEXLlamaAttention(_IPEXAttention):
                 del self.__dict__["_modules"]["o_proj"]
 
     def qkv_gemm(self, hidden_states):
+        bsz, seq_len, _ = hidden_states.shape
         qkv_out = self.concat_qkv(hidden_states)
-        query = qkv_out[:, :, : self.q_slice].view(-1, self.num_heads, self.head_dim)
-        key = qkv_out[:, :, self.q_slice : self.k_slice].view(-1, self.num_key_value_heads, self.head_dim)
-        value = qkv_out[:, :, self.k_slice :].view(-1, self.num_key_value_heads, self.head_dim)
+        query = qkv_out[:, :, : self.q_slice].view(bsz, seq_len, self.num_heads, self.head_dim)
+        key = qkv_out[:, :, self.q_slice : self.k_slice].view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        value = qkv_out[:, :, self.k_slice :].view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
         return query, key, value
 
