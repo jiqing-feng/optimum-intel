@@ -226,6 +226,7 @@ class _IPEXAttention(nn.Module):
             attn_output = attn_output.view(bsz, q_len, -1)
         else:
             # decode
+            query = query.view(-1, self.num_heads, self.head_dim)
             attn_output = torch.empty_like(query)
             PagedAttention.single_query_cached_kv_attention(
                 attn_output,
