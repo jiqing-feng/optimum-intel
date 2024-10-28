@@ -242,7 +242,7 @@ class _IPEXAttention(nn.Module):
                 past_key_value.input_lens.max(),
                 None,
             )
-            attn_output = attn_output.reshape(-1, attn_output.shape[-2] * attn_output.shape[-1])
+            attn_output = attn_output.reshape(-1, 1, attn_output.shape[-2] * attn_output.shape[-1])
 
         if not output_attentions:
             attn_weights = None
