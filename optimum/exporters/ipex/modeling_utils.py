@@ -656,6 +656,30 @@ class _IPEXAttention(nn.Module):
 class _IPEXLlamaAttention(_IPEXAttention):
     def __init__(self, module, config) -> None:
         super().__init__(module, config)
+        if all([isinstance(proj, nn.Linear) for proj in [self.q_proj, self.k_proj, self.v_proj]]):
+            self.create_concat_linear()
+        if self.module_device.type == "cpu":
+            if module.o_proj.__class__.__name__ not in ["LinearAllreduce"]:
+                self.mha_linear_add = LinearAdd(module.o_proj)
+
+        elif self.module_device.type == "xpu":
+            if module.o_proj.__class__.__name__ not in ["LinearAllreduce"]:
+                self.mha_linear_add = XPULinearAdd(module.o_proj)
+
+    def qkv_gemm(self, hidden_states):
+        if hasattr(self, "concat_qkv"):
+            qkv_out = self.concat_qkv(hidden_states)
+            query = qkv_out[:, : self.q_slice].view(-1, self.num_heads, self.head_dim)
+            key = qkv_out[:, self.q_slice : self.k_slice].view(-1, self.num_key_value_heads, self.head_dim)
+            value = qkv_out[:, self.k_slice :].view(-1, self.num_key_value_heads, self.head_dim)
+        else:
+            query = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
+            key = self.k_proj(hidden_states).view(-1, self.num_key_value_heads, self.head_dim)
+            value = self.v_proj(hidden_states).view(-1, self.num_key_value_heads, self.head_dim)
+
+        return query, key, value
+
+    def create_concat_linear(self):
         concat_weight = torch.concat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight]).contiguous()
         bias_list = [bias for bias in [self.q_proj.bias, self.k_proj.bias, self.v_proj.bias] if bias]
         use_bias = bias_list != []
@@ -667,21 +691,6 @@ class _IPEXLlamaAttention(_IPEXAttention):
         self.q_slice = self.q_proj.out_features
         self.k_slice = self.q_slice + self.k_proj.out_features
         self.v_slice = self.k_slice + self.v_proj.out_features
-        if self.module_device.type == "cpu":
-            if module.o_proj.__class__.__name__ not in ["LinearAllreduce"]:
-                self.mha_linear_add = LinearAdd(module.o_proj)
-
-        elif self.module_device.type == "xpu":
-            if module.o_proj.__class__.__name__ not in ["LinearAllreduce"]:
-                self.mha_linear_add = XPULinearAdd(module.o_proj)
-
-    def qkv_gemm(self, hidden_states):
-        qkv_out = self.concat_qkv(hidden_states)
-        query = qkv_out[:, : self.q_slice].view(-1, self.num_heads, self.head_dim)
-        key = qkv_out[:, self.q_slice : self.k_slice].view(-1, self.num_key_value_heads, self.head_dim)
-        value = qkv_out[:, self.k_slice :].view(-1, self.num_key_value_heads, self.head_dim)
-
-        return query, key, value
 
     def rope(self, query, key, **kwargs):
         position_embeddings = kwargs.pop("position_embeddings", None)
