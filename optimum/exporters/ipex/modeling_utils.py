@@ -134,6 +134,7 @@ class XPUlinearAddAdd(torch.nn.Module):
 
 
 # Adapted from https://github.com/huggingface/transformers/blob/v4.38.2/src/transformers/models/llama/modeling_llama.py#L83
+@torch.compiler.disable
 def _ipex_rms_layer_norm_forward(self, hidden_states):
     return rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
@@ -588,6 +589,27 @@ class _IPEXAttention(nn.Module):
         attn_output = attn_output.reshape(-1, attn_output.shape[-2] * attn_output.shape[-1])
         return attn_output
 
+    @torch.compiler.disable
+    def varlen_attention(self, query, key, value, past_key_value, input_lens):
+        attn_output = torch.empty_like(query)
+        # prefill, remove padding
+        seq_len_tensor = torch.cat((input_lens.new_tensor([0]), input_lens.cumsum(-1).int()))
+        PagedAttention.flash_attn_varlen_func(
+            attn_output,
+            query,
+            key,
+            value,
+            seq_len_tensor,
+            seq_len_tensor,
+            input_lens.max(),
+            input_lens.max(),
+            1.0 / math.sqrt(self.head_dim),
+            True,
+            past_key_value.block_tables,
+            None,
+        )
+        return attn_output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -610,26 +632,12 @@ class _IPEXAttention(nn.Module):
         if past_key_value is not None:
             key_cache, value_cache = past_key_value.update(key, value, self.layer_idx, attention_mask, input_lens)
 
-        attn_output = torch.empty_like(query)
         if past_len == 0:
             # prefill, remove padding
-            seq_len_tensor = torch.cat((input_lens.new_tensor([0]), input_lens.cumsum(-1).int()))
-            PagedAttention.flash_attn_varlen_func(
-                attn_output,
-                query,
-                key_cache,
-                value_cache,
-                seq_len_tensor,
-                seq_len_tensor,
-                input_lens.max(),
-                input_lens.max(),
-                1.0 / math.sqrt(self.head_dim),
-                True,
-                past_key_value.block_tables,
-                None,
-            )
+            attn_output = self.varlen_attention(query, key, value, past_key_value, input_lens)
         else:
             # decode
+            attn_output = torch.empty_like(query)
             PagedAttention.single_query_cached_kv_attention(
                 attn_output,
                 query,
@@ -760,11 +768,15 @@ class _IPEXLlamaMLP(nn.Module):
                 self.mlp_linear_add = XPULinearAdd(module.down_proj)
             self.linear_silu_mul = XPULinear2SiluMul(module.gate_proj, module.up_proj)
 
+    @torch.compiler.disable
+    def linear_add(self, a, b):
+        return self.mlp_linear_add(a, b)
+
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor = None, **kwargs):
         if hasattr(self, "linear_silu_mul"):
             mlp_gate = self.linear_silu_mul(hidden_states)
             if hasattr(self, "mlp_linear_add"):
-                hidden_states = self.mlp_linear_add(mlp_gate, residual)
+                hidden_states = self.linear_add(mlp_gate, residual)
             else:
                 hidden_states = self.down_proj(mlp_gate)
                 hidden_states = residual + hidden_states
@@ -817,6 +829,10 @@ class _IPEXLlamaDecoderLayer(nn.Module):
         self.self_attn = _IPEXLlamaAttention(module.self_attn, config)
         self.mlp = _IPEXLlamaMLP(module.mlp, config)
 
+    @torch.compiler.disable
+    def linear_add(self, a, b):
+        return self.self_attn.mha_linear_add(a, b)
+
     def forward(self, hidden_states: torch.Tensor, **kwargs):
         # Please see the original model's forward to check the parameter
         residual = hidden_states
@@ -825,7 +841,7 @@ class _IPEXLlamaDecoderLayer(nn.Module):
         hidden_states, present, attn_weights = self.self_attn(hidden_states=hidden_states, **kwargs)
 
         if hasattr(self.self_attn, "mha_linear_add"):
-            hidden_states = self.self_attn.mha_linear_add(hidden_states, residual)
+            hidden_states = self.linear_add(hidden_states, residual)
         else:
             hidden_states = self.self_attn.o_proj(hidden_states)
             hidden_states = residual + hidden_states
