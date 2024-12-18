@@ -138,7 +138,7 @@ class XPUlinearAddAdd(torch.nn.Module):
 
 
 # Adapted from https://github.com/huggingface/transformers/blob/v4.38.2/src/transformers/models/llama/modeling_llama.py#L83
-@torch.compiler.disable
+# @torch.compiler.disable
 def _ipex_rms_layer_norm_forward(self, hidden_states):
     return rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
@@ -818,7 +818,7 @@ class _IPEXLlamaMLP(nn.Module):
                 self.mlp_linear_add = XPULinearAdd(module.down_proj)
             self.linear_silu_mul = XPULinear2SiluMul(module.gate_proj, module.up_proj)
 
-    @torch.compiler.disable
+    # @torch.compiler.disable
     def linear_add(self, a, b):
         return self.mlp_linear_add(a, b)
 
@@ -913,7 +913,7 @@ class _IPEXLlamaDecoderLayer(nn.Module):
         self.self_attn = _IPEXLlamaAttention(module.self_attn, config)
         self.mlp = _IPEXLlamaMLP(module.mlp, config)
 
-    @torch.compiler.disable
+    # @torch.compiler.disable
     def linear_add(self, a, b):
         return self.self_attn.mha_linear_add(a, b)
 
