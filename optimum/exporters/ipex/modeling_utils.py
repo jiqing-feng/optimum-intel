@@ -19,6 +19,9 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
 from transformers.cache_utils import Cache
+from transformers.modeling_attn_mask_utils import (
+    _prepare_4d_causal_attention_mask_for_sdpa,
+)
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPastAndCrossAttentions
 
 from optimum.intel.utils.import_utils import is_ipex_version
@@ -29,7 +32,7 @@ from .cache_utils import IPEXPagedCache
 
 logger = logging.getLogger(__name__)
 
-_IPEX_MINIMUM_VERSION_FOR_PATCHING = "2.4.0"
+_IPEX_MINIMUM_VERSION_FOR_PATCHING = "2.5.0"
 
 
 if is_ipex_version("<", _IPEX_MINIMUM_VERSION_FOR_PATCHING):
@@ -37,12 +40,13 @@ if is_ipex_version("<", _IPEX_MINIMUM_VERSION_FOR_PATCHING):
         f"Please upgrade the IPEX version to at least {_IPEX_MINIMUM_VERSION_FOR_PATCHING} if you want to patch the model."
     )
 else:
-    from intel_extension_for_pytorch.llm.functional import rms_norm, rotary_embedding, varlen_attention
+    from intel_extension_for_pytorch.llm.functional import rms_norm, rotary_embedding
     from intel_extension_for_pytorch.llm.modules import (
         Linear2SiluMul,
         LinearAdd,
         LinearAddAdd,
         LinearGelu,
+        LinearNewGelu,
         PagedAttention,
     )
 
@@ -195,7 +199,10 @@ def _llama_model_forward(
     next_decoder_cache = () if use_cache else None
 
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
-    if past_key_values_length == 0:
+
+    input_lens = attention_mask.cumsum(-1)[:, -1].to(torch.int32)
+
+    if past_key_values_length == 0 and past_key_values is not None:
         # first token, remove the padding from hidden_states, varlen do not accept attention mask
         hidden_states_copy = hidden_states
         index = attention_mask.view(-1) != 0
@@ -208,7 +215,13 @@ def _llama_model_forward(
     else:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
-    input_lens = attention_mask.cumsum(-1)[:, -1].to(torch.int32)
+    if past_key_values is None:
+        attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+            attention_mask=attention_mask,
+            input_shape=(input_ids.shape[0], input_ids.shape[-1]),
+            inputs_embeds=inputs_embeds,
+            past_key_values_length=past_key_values_length,
+        )
 
     for idx, decoder_layer in enumerate(self.layers):
         if output_hidden_states:
@@ -310,7 +323,9 @@ def _falcon_model_forward(
     # create position embeddings to be shared across the decoder layers
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-    if past_key_values_length == 0:
+    input_lens = attention_mask.cumsum(-1)[:, -1].to(torch.int32)
+
+    if past_key_values_length == 0 and past_key_values is not None:
         # first token, remove the padding from hidden_states, varlen do not accept attention mask
         hidden_states_copy = hidden_states
         index = attention_mask.view(-1) != 0
@@ -322,7 +337,14 @@ def _falcon_model_forward(
         position_embeddings = (cos.unsqueeze(1), sin.unsqueeze(1))
     else:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    input_lens = attention_mask.cumsum(-1)[:, -1].to(torch.int32)
+
+    if past_key_values is None:
+        attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+            attention_mask=attention_mask,
+            input_shape=(input_ids.shape[0], input_ids.shape[-1]),
+            inputs_embeds=inputs_embeds,
+            past_key_values_length=past_key_values_length,
+        )
 
     next_decoder_cache = None
     all_self_attentions = () if output_attentions else None
@@ -437,7 +459,9 @@ def _gpt2_model_forward(
 
     hidden_states = self.drop(hidden_states)
 
-    if past_length == 0:
+    input_lens = attention_mask.cumsum(-1)[:, -1].to(torch.int32)
+
+    if past_length == 0 and past_key_values is not None:
         # first token, remove the padding from hidden_states, varlen do not accept attention mask
         hidden_states_copy = hidden_states
         index = attention_mask.view(-1) != 0
@@ -445,7 +469,13 @@ def _gpt2_model_forward(
     else:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
-    input_lens = attention_mask.cumsum(-1)[:, -1].to(torch.int32)
+    if past_key_values is None:
+        attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+            attention_mask=attention_mask,
+            input_shape=(input_ids.shape[0], input_ids.shape[-1]),
+            inputs_embeds=inputs_embeds,
+            past_key_values_length=past_length,
+        )
 
     presents = None
     all_self_attentions = () if output_attentions else None
@@ -529,7 +559,10 @@ def _gpt2_block_forward(
     attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
     outputs = attn_outputs[1:]
     # residual connection
-    hidden_states = attn_output + residual
+    if hasattr(self.attn, "linear_add"):
+        hidden_states = self.attn.linear_add(attn_output, residual)
+    else:
+        hidden_states = attn_output + residual
 
     if encoder_hidden_states is not None:
         # add one self-attention block for cross-attention
@@ -558,7 +591,10 @@ def _gpt2_block_forward(
     hidden_states = self.ln_2(hidden_states)
     feed_forward_hidden_states = self.mlp(hidden_states)
     # residual connection
-    hidden_states = residual + feed_forward_hidden_states
+    if hasattr(self.mlp, "linear_add"):
+        hidden_states = self.mlp.linear_add(feed_forward_hidden_states, residual)
+    else:
+        hidden_states = residual + feed_forward_hidden_states
 
     if use_cache:
         outputs = (hidden_states,) + outputs
@@ -578,6 +614,7 @@ class _IPEXAttention(nn.Module):
         self.kv_head_mapping = torch.arange(
             0, self.num_key_value_heads, dtype=torch.int32, device=self.module_device
         ).repeat_interleave(self.num_groups)
+        self.use_sdpa = False
 
     def qkv_gemm(self, hidden_states):
         raise NotImplementedError("Need to implement in specific model class")
@@ -586,6 +623,8 @@ class _IPEXAttention(nn.Module):
         raise NotImplementedError("Need to implement in specific model class")
 
     def postprocess_attention_output(self, attn_output):
+        if self.use_sdpa:
+            attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(-1, attn_output.shape[-2] * attn_output.shape[-1])
         return attn_output
 
@@ -637,6 +676,7 @@ class _IPEXAttention(nn.Module):
             attn_output = self.varlen_attention(query, key, value, past_key_value, input_lens)
         else:
             # decode
+            attn_output = torch.empty_like(query)
             attn_output = torch.empty_like(query)
             PagedAttention.single_query_cached_kv_attention(
                 attn_output,
@@ -733,6 +773,13 @@ class _IPEXGPT2Attention(_IPEXAttention):
         self.c_proj_linear = nn.Linear(self.c_proj.weight.shape[0], self.c_proj.weight.shape[1])
         self.c_proj_linear.weight = nn.Parameter(self.c_proj.weight.t())
         self.c_proj_linear.bias = self.c_proj.bias
+        if self.module_device.type == "cpu":
+            if self.c_proj_linear not in ["LinearAllreduce"]:
+                self.linear_add = LinearAdd(self.c_proj_linear)
+
+        elif self.module_device.type == "xpu":
+            if self.c_proj_linear not in ["LinearAllreduce"]:
+                self.linear_add = XPULinearAdd(self.c_proj_linear)
 
     def qkv_gemm(self, hidden_states):
         query, key, value = self.c_attn_linear(hidden_states).split(self.split_size, dim=-1)
@@ -745,8 +792,11 @@ class _IPEXGPT2Attention(_IPEXAttention):
         return query, key
 
     def postprocess_attention_output(self, attn_output):
+        if self.use_sdpa:
+            attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(-1, attn_output.shape[-2] * attn_output.shape[-1])
-        attn_output = self.c_proj(attn_output)
+        if not hasattr(self, "linear_add"):
+            attn_output = self.c_proj(attn_output)
         return attn_output
 
 
@@ -819,6 +869,40 @@ class _IPEXFalconMLP(nn.Module):
             output = mlp_output + attention_output + residual
 
         return output
+
+
+class _IPEXGPT2MLP(nn.Module):
+    def __init__(self, module, config) -> None:
+        super().__init__()
+        _setattr_from_module(self, module)
+        self.config = config
+        self.module_device = next(module.parameters()).device
+        self.c_fc_linear = nn.Linear(self.c_fc.weight.shape[0], self.c_fc.weight.shape[1])
+        self.c_fc_linear.weight = nn.Parameter(self.c_fc.weight.t())
+        self.c_fc_linear.bias = self.c_fc.bias
+        self.c_proj_linear = nn.Linear(self.c_proj.weight.shape[0], self.c_proj.weight.shape[1])
+        self.c_proj_linear.weight = nn.Parameter(self.c_proj.weight.t())
+        self.c_proj_linear.bias = self.c_proj.bias
+        if self.module_device.type == "cpu":
+            self.linear_new_gelu = LinearNewGelu(self.c_fc_linear)
+
+        if self.module_device.type == "cpu":
+            if self.c_proj_linear not in ["LinearAllreduce"]:
+                self.linear_add = LinearAdd(self.c_proj_linear)
+
+        elif self.module_device.type == "xpu":
+            if self.c_proj_linear not in ["LinearAllreduce"]:
+                self.linear_add = XPULinearAdd(self.c_proj_linear)
+
+    def forward(self, hidden_states: Optional[Tuple[torch.FloatTensor]]) -> torch.FloatTensor:
+        if hasattr(self, "linear_new_gelu"):
+            hidden_states = self.linear_new_gelu(hidden_states)
+        else:
+            hidden_states = self.c_fc(hidden_states)
+            hidden_states = self.act(hidden_states)
+        if not hasattr(self, "linear_add"):
+            hidden_states = self.c_proj(hidden_states)
+        return hidden_states
 
 
 # Adapted from https://github.com/huggingface/transformers/blob/v4.38.2/src/transformers/models/llama/modeling_llama.py#L694
