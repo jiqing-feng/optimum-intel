@@ -31,7 +31,7 @@ import timm
 import torch
 from datasets import load_dataset
 from evaluate import evaluator
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_hub_download
 from parameterized import parameterized
 from PIL import Image
 from sentence_transformers import SentenceTransformer
@@ -1040,12 +1040,6 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
     def test_compare_to_transformers(self, model_arch):
         model_id = MODEL_NAMES[model_arch]
 
-        # TODO: add back once dtype fixed everywhere
-        # https://huggingface.co/katuni4ka/tiny-random-chatglm2/blob/main/modeling_chatglm.py#L720
-        # https://huggingface.co/katuni4ka/tiny-random-chatglm2/blob/main/modeling_chatglm.py#L759
-        if model_arch in {"chatglm", "glm4"} and is_transformers_version(">=", "4.49"):
-            self.skipTest("Incompatible modeling code")
-
         not_stateful = []
         if is_openvino_version("<", "2024.0"):
             not_stateful.append("mixtral")
@@ -1126,7 +1120,7 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
         ov_outputs = ov_model.generate(**tokens, generation_config=gen_config)
 
         # TODO: add back once https://huggingface.co/katuni4ka/tiny-random-minicpm3/discussions/1 merged (for all models) as current mdoeling incompatible with transformers >= v4.49
-        if model_arch in {"minicpm", "minicpm3", "arctic", "deepseek"} and is_transformers_version(">=", "4.49"):
+        if model_arch in {"deepseek"} and is_transformers_version(">=", "4.49"):
             self.skipTest("Incompatible modeling code")
 
         additional_inputs = {}
@@ -1320,6 +1314,10 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
         # Qwen tokenizer does not support padding, chatglm, glm4 testing models produce nan that incompatible with beam search
         if model_arch in ["qwen", "chatglm", "glm4"]:
             return
+
+        # TODO: add back once https://huggingface.co/katuni4ka/tiny-random-minicpm3/discussions/1 merged (for all models) as current mdoeling incompatible with transformers >= v4.49
+        if model_arch in {"deepseek"} and is_transformers_version(">=", "4.49"):
+            self.skipTest("Incompatible modeling code")
 
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=model_arch in self.REMOTE_CODE_MODELS)
         if model_arch == "persimmon":
@@ -2126,17 +2124,25 @@ class OVModelForPix2StructIntegrationTest(unittest.TestCase):
 
 class OVModelForVisualCausalLMIntegrationTest(unittest.TestCase):
     SUPPORTED_ARCHITECTURES = ["llava"]
+    SUPPORT_VIDEO = []
 
     if is_transformers_version(">=", "4.40.0"):
         SUPPORTED_ARCHITECTURES += ["llava_next", "nanollava"]
+
+    if is_transformers_version(">=", "4.42.0"):
+        SUPPORTED_ARCHITECTURES += ["llava_next_video"]
+        SUPPORT_VIDEO.append("llava_next_video")
+
     if is_transformers_version(">=", "4.45.0"):
         SUPPORTED_ARCHITECTURES += ["minicpmv", "internvl2", "phi3_v", "qwen2_vl"]
+        SUPPORT_VIDEO.append("qwen2_vl")
 
     if is_transformers_version(">=", "4.46.0"):
         SUPPORTED_ARCHITECTURES += ["maira2"]
 
     if is_transformers_version(">=", "4.49.0"):
         SUPPORTED_ARCHITECTURES += ["qwen2_5_vl"]
+        SUPPORT_VIDEO.append("qwen2_5_vl")
     TASK = "image-text-to-text"
     REMOTE_CODE_MODELS = ["internvl2", "minicpmv", "nanollava", "phi3_v", "maira2"]
 
@@ -2152,7 +2158,11 @@ class OVModelForVisualCausalLMIntegrationTest(unittest.TestCase):
             from transformers import AutoModelForImageTextToText
 
             return AutoModelForImageTextToText
-        if model_arch in "llava":
+        if model_arch == "llava_next_video":
+            from transformers import AutoModelForVision2Seq
+
+            return AutoModelForVision2Seq
+        if model_arch == "llava":
             from transformers import LlavaForConditionalGeneration
 
             return LlavaForConditionalGeneration
@@ -2240,10 +2250,6 @@ class OVModelForVisualCausalLMIntegrationTest(unittest.TestCase):
         ov_outputs = ov_model.generate(**inputs, generation_config=gen_config)
         set_seed(SEED)
 
-        # TODO: add back once https://huggingface.co/katuni4ka/tiny-random-minicpm3/discussions/1 merged for all models as current mdoeling incompatible with transformers >= v4.49
-        if model_arch in {"phi3_v", "nanollava"} and is_transformers_version(">=", "4.49"):
-            self.skipTest("Incompatible modeling code")
-
         with torch.no_grad():
             transformers_outputs = transformers_model.generate(**transformers_inputs, generation_config=gen_config)
 
@@ -2259,7 +2265,7 @@ class OVModelForVisualCausalLMIntegrationTest(unittest.TestCase):
 
         gc.collect()
 
-    @parameterized.expand(["llava", "llava_next"])
+    @parameterized.expand(["llava", "llava_next", "llava_next_video"])
     @unittest.skipIf(
         is_transformers_version("<", "4.45.0"), reason="New preprocessing available only in transformers >= 4.45"
     )
@@ -2341,6 +2347,22 @@ class OVModelForVisualCausalLMIntegrationTest(unittest.TestCase):
         outputs = outputs[:, inputs["input_ids"].shape[1] :]
         outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
         self.assertIsInstance(outputs[0], str)
+
+        # video loader helper only available for transformers >= 4.49
+        if model_arch in self.SUPPORT_VIDEO and is_transformers_version(">=", "4.49"):
+            from transformers.image_utils import load_video
+
+            video_path = hf_hub_download(
+                repo_id="raushan-testing-hf/videos-test", filename="sample_demo_1.mp4", repo_type="dataset"
+            )
+            input_video, _ = load_video(video_path, num_frames=2)
+            question = "Why is this video funny?"
+            inputs = model.preprocess_inputs(**preprocessors, text=question, video=input_video)
+            outputs = model.generate(**inputs, max_new_tokens=10)
+            # filter out original prompt becuase it may contains out of tokenizer tokens e.g. in nanollva text separator = -200
+            outputs = outputs[:, inputs["input_ids"].shape[1] :]
+            outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            self.assertIsInstance(outputs[0], str)
         del model
 
         gc.collect()
