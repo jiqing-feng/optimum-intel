@@ -68,7 +68,7 @@ _IPEX_MINIMUM_VERSION_FOR_COMPILE = "2.5.0"
 if is_torch_version("<", "2.6"):
     _COMPILE_NOT_READY_MODEL_TYPES = ("electra", "roformer", "gpt_neox", "beit", "llama", "falcon", "gpt2", "qwen2")
 else:
-    _COMPILE_NOT_READY_MODEL_TYPES = ("llama", "falcon", "gpt2", "qwen2")
+    _COMPILE_NOT_READY_MODEL_TYPES = () #("llama", "falcon", "gpt2", "qwen2")
 
 
 try:
@@ -253,7 +253,7 @@ class IPEXModel(OptimizedModel):
         inductor_config.cpp_wrapper = True
         os.environ["TORCHINDUCTOR_FREEZING"] = "1"
         logger.info("Enable torch.compile optimization")
-        self.model.forward = torch.compile(self.model.forward)
+        self.model.forward = torch.compile(self.model.forward, mode="max-autotune")
 
     def _init_warmup(self):
         inputs = prepare_jit_inputs(self.model, self.export_feature, False)
